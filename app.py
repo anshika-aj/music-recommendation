@@ -10,10 +10,10 @@ st.set_page_config(
     page_icon="🎵",
     layout="wide"
 )
-#update it 
+
 df = pd.read_csv("data/spotify_clustered_dataset.csv")
 scaler = joblib.load("models/scaler.joblib")
-kmeans = joblib.load("models/kmeans.joblib")
+kmeans = joblib.load("models/kmeans.joblib")  # kept for EDA/cluster count metric only
 
 DEFAULT_IMAGE = "https://storage.googleapis.com/pr-newsroom-wp/1/2018/11/Spotify_Logo_CMYK_Green.png"
 
@@ -118,10 +118,13 @@ st.sidebar.divider()
 st.sidebar.markdown("""
 ### ⚙️ Model
 
-- KMeans Clustering
+- Global Nearest-Neighbour Search
 - Cosine Similarity
+- Genre-aware filtering
+- Popularity re-ranking
+- Artist-diversity cap
 - StandardScaler
-- 13 Audio Features
+- 10 Audio Features
 """)
 
 
@@ -196,78 +199,82 @@ recommend_clicked = st.button(
 )
 
 @st.cache_resource
-def build_scaled_clusters():
-    # Store only each cluster's scaled feature matrix (O(n) memory),
-    # not the full NxN similarity matrix (O(n^2) — blows up on large clusters).
-    # Similarity is computed on-demand per query in recommend().
-    scaled_dict = {}
+def get_scaled_features():
+    # Scale the whole dataset once (O(n) memory) instead of per-cluster.
+    # Similarity for a query song is computed on demand (1 x N), never a
+    # precomputed N x N matrix — that's what made the old approach need a
+    # KMeans pre-filter in the first place.
+    return scaler.transform(df[feature_columns])
 
-    for cluster in sorted(df["cluster"].unique()):
+X_scaled = get_scaled_features()
 
-        cluster_df = df[df["cluster"] == cluster]
+def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, max_per_artist=2):
+    """
+    Global nearest-neighbour recommender — no KMeans gate.
 
-        scaled_dict[cluster] = scaler.transform(
-            cluster_df[feature_columns]
-        )
-
-    return scaled_dict
-
-scaled_clusters = build_scaled_clusters()
-    
-def recommend(song_name, n=10, restrict_genre=None):
+    restrict_genre     : a specific genre string to restrict candidates to, or
+                          None/"All" for a full-dataset search.
+    popularity_weight   : small re-rank nudge on top of audio similarity, not
+                          a popularity recommender.
+    max_per_artist      : caps how many songs from one artist can appear in
+                          the results (artist-diversity constraint).
+    """
 
     try:
         selected_row = df[
-        (df["track_name"] == song_name) &
-        (df["artists"] == selected_artist)
-    ].iloc[0]
+            (df["track_name"] == song_name) &
+            (df["artists"] == selected_artist)
+        ].iloc[0]
         idx = selected_row.name
     except IndexError:
         return []
 
-    cluster = df.loc[idx, "cluster"]
-
-    cluster_df = df[df["cluster"] == cluster].copy()
-
-    cluster_scaled = scaled_clusters[cluster]
-
-    local_idx = cluster_df.index.get_loc(idx)
-
-    similarity = cosine_similarity(
-        cluster_scaled[local_idx].reshape(1, -1),
-        cluster_scaled
-    ).flatten()
-
-    scores = list(enumerate(similarity))
+    query_pos = df.index.get_loc(idx)
+    query_vec = X_scaled[query_pos].reshape(1, -1)
 
     if restrict_genre and restrict_genre != "All":
-        allowed_positions = set(
-            cluster_df.index.get_loc(i)
-            for i in cluster_df[cluster_df.track_genre == restrict_genre].index
-        )
-        scores = [(i, s) for i, s in scores if i in allowed_positions]
+        pool_df = df[df["track_genre"] == restrict_genre]
+    else:
+        pool_df = df
 
-    scores = sorted(scores, key=lambda x: x[1], reverse=True)
+    pool_positions = df.index.get_indexer(pool_df.index)
+    pool_scaled = X_scaled[pool_positions]
+
+    similarity = cosine_similarity(query_vec, pool_scaled).flatten()
+
+    pop = pool_df["popularity"].to_numpy(dtype=float)
+    pop_range = pop.max() - pop.min()
+    pop_norm = (pop - pop.min()) / pop_range if pop_range > 0 else np.zeros_like(pop)
+
+    final_score = (1 - popularity_weight) * similarity + popularity_weight * pop_norm
+
+    order = np.argsort(-final_score)
 
     recommendations = []
-
     seen = set()
+    artist_count = {}
 
-    for i, score in scores:
+    for pos in order:
 
-        song = cluster_df.iloc[i]
+        song = pool_df.iloc[pos]
+
+        if song.name == idx:
+            continue  # skip the query song itself (matched by index, not just name)
 
         key = (song.track_name, song.artists)
 
         if key in seen:
             continue
 
-        seen.add(key)
+        primary_artist = song.artists.split(";")[0]
 
-        if song.track_name == song_name:
+        if artist_count.get(primary_artist, 0) >= max_per_artist:
             continue
 
-        recommendations.append((song, score))
+        seen.add(key)
+        artist_count[primary_artist] = artist_count.get(primary_artist, 0) + 1
+
+        recommendations.append((song, final_score[pos]))
 
         if len(recommendations) == n:
             break
@@ -311,7 +318,7 @@ if recommend_clicked:
                 )
             st.progress(min(float(score),1.0))
             st.caption(
-    f"Similarity Score : {score*100:.1f}%"
+    f"Match Score : {score*100:.0f}"
 )
             st.markdown(f"""
 <div class="card">

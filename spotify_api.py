@@ -1,22 +1,22 @@
+import streamlit as st
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
-CLIENT_ID = "b12f48a5d15040a1af5705665b587162"
-CLIENT_SECRET = "a060a44d7683450cb7cfb8c04cf2f2c4"
 
-client_credentials_manager = SpotifyClientCredentials(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET
-)
-
-sp = spotipy.Spotify(
-    client_credentials_manager=client_credentials_manager
-)
+@st.cache_resource
+def _get_client():
+    client_credentials_manager = SpotifyClientCredentials(
+        client_id=st.secrets["SPOTIFY_CLIENT_ID"],
+        client_secret=st.secrets["SPOTIFY_CLIENT_SECRET"],
+    )
+    return spotipy.Spotify(client_credentials_manager=client_credentials_manager)
 
 
 def get_album_cover(song, artist):
 
     try:
+
+        sp = _get_client()
 
         result = sp.search(
             q=f"track:{song} artist:{artist}",
@@ -32,5 +32,5 @@ def get_album_cover(song, artist):
 
         return None
 
-    except:
+    except Exception:
         return None
