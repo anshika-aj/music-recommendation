@@ -11,77 +11,250 @@ st.set_page_config(
     layout="wide"
 )
 
-df = pd.read_csv("data/spotify_clustered_dataset.csv")
+df = pd.read_csv("dataset/spotify_clustered_dataset.csv")
 scaler = joblib.load("models/scaler.joblib")
 kmeans = joblib.load("models/kmeans.joblib")  # kept for EDA/cluster count metric only
 
 DEFAULT_IMAGE = "https://storage.googleapis.com/pr-newsroom-wp/1/2018/11/Spotify_Logo_CMYK_Green.png"
 
-st.markdown("""
-<style>
+# ---------------------------------------------------------------------------
+# Design tokens
+#   bg        #0B0F0D  near-black, faint green undertone
+#   surface   #141B17  elevated card surface
+#   line      #223028  hairline borders
+#   accent    #29D398  emerald — the app's one bright color
+#   highlight #FFC857  warm amber — used only for the match badge
+#   text      #F5F7F5  soft off-white
+#   muted     #93A29B  sage grey
+# ---------------------------------------------------------------------------
+
+_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600&display=swap');
+
+:root{
+    --bg:#0B0F0D;
+    --surface:#141B17;
+    --line:#223028;
+    --accent:#29D398;
+    --accent-dim:#1B8F68;
+    --highlight:#FFC857;
+    --text:#F5F7F5;
+    --muted:#93A29B;
+}
+
+html, body, [class*="css"]{
+    font-family:'Inter', sans-serif;
+}
+
+h1,h2,h3,h4{
+    font-family:'Sora', sans-serif;
+}
 
 .stApp{
-    background:#121212;
-    color:white;
+    background:var(--bg);
+    color:var(--text);
 }
 
 section[data-testid="stSidebar"]{
-    background:#181818;
+    background:var(--surface);
+    border-right:1px solid var(--line);
 }
 
 .block-container{
-    padding-top:1.5rem;
+    padding-top:2rem;
+    max-width:1200px;
 }
 
 .hero{
-    background:linear-gradient(135deg,#1DB954,#191414);
-    padding:35px;
-    border-radius:18px;
-    margin-bottom:25px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:24px;
+    padding:36px 40px;
+    margin-bottom:28px;
+    border-radius:20px;
+    background:linear-gradient(120deg, #0E4A38 0%, #0B0F0D 75%);
+    border:1px solid var(--line);
 }
 
-.hero h1{
-    color:white;
-    text-align:center;
-    font-size:50px;
+.hero-title{
+    font-size:34px;
+    font-weight:800;
+    color:var(--text);
+    margin:0 0 6px 0;
 }
 
-.hero p{
-    text-align:center;
-    color:white;
+.hero-sub{
+    font-size:15px;
+    color:var(--muted);
+    margin:0;
+    max-width:480px;
 }
 
-.card{
+.hero-mark{
+    font-size:44px;
+    line-height:1;
+}
 
-    height:180px;
+.stat-strip{
+    display:flex;
+    align-items:baseline;
+    gap:36px;
+    padding:18px 4px 28px 4px;
+    border-bottom:1px solid var(--line);
+    margin-bottom:28px;
+    flex-wrap:wrap;
+}
+
+.stat-lead .stat-num{
+    font-size:36px;
+    font-weight:800;
+    color:var(--accent);
+    font-family:'Sora', sans-serif;
+}
+
+.stat-lead .stat-label{
+    font-size:13px;
+    color:var(--muted);
+}
+
+.stat-minor{
     display:flex;
     flex-direction:column;
-    justify-content:center; 
-    background:#181818;
-    border-radius:18px;
-    padding:18px;
-    border:1px solid #2a2a2a;
-    box-shadow:0 10px 25px rgba(0,0,0,.4);
-    margin-bottom:20px;
-
 }
 
-img{
-
-    border-radius:15px;
-
+.stat-minor .stat-num{
+    font-size:20px;
+    font-weight:600;
+    color:var(--text);
+    font-family:'Sora', sans-serif;
 }
 
-</style>""",
-unsafe_allow_html=True
+.stat-minor .stat-label{
+    font-size:12px;
+    color:var(--muted);
+}
+
+.sidebar-title{
+    font-family:'Sora', sans-serif;
+    font-size:20px;
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:2px;
+}
+
+.sidebar-sub{
+    font-size:12px;
+    color:var(--accent);
+    margin-bottom:18px;
+}
+
+.chip-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+    margin-top:6px;
+}
+
+.chip{
+    font-size:11px;
+    color:var(--text);
+    background:rgba(41,211,152,0.12);
+    border:1px solid rgba(41,211,152,0.35);
+    padding:5px 10px;
+    border-radius:20px;
+}
+
+.rec-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));
+    gap:22px;
+    margin-top:6px;
+}
+
+.poster-card{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:16px;
+    overflow:hidden;
+    transition:transform .15s ease, border-color .15s ease;
+}
+
+.poster-card:hover{
+    transform:translateY(-4px);
+    border-color:var(--accent-dim);
+}
+
+.poster-image{
+    position:relative;
+    width:100%;
+    aspect-ratio:1/1;
+    background-size:cover;
+    background-position:center;
+    display:flex;
+    align-items:flex-end;
+}
+
+.poster-badge{
+    position:absolute;
+    top:10px;
+    right:10px;
+    background:var(--highlight);
+    color:#241A00;
+    font-size:12px;
+    font-weight:700;
+    padding:4px 9px;
+    border-radius:20px;
+}
+
+.poster-scrim{
+    width:100%;
+    padding:34px 14px 12px 14px;
+    background:linear-gradient(180deg, rgba(11,15,13,0) 0%, rgba(11,15,13,0.92) 78%);
+}
+
+.poster-scrim h4{
+    margin:0;
+    font-size:15px;
+    color:#fff;
+    line-height:1.25;
+}
+
+.poster-scrim p{
+    margin:2px 0 0 0;
+    font-size:12.5px;
+    color:rgba(255,255,255,0.75);
+}
+
+.poster-meta{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:10px 14px 14px 14px;
+}
+
+.genre-chip{
+    font-size:11px;
+    color:var(--accent);
+    background:rgba(41,211,152,0.10);
+    padding:3px 9px;
+    border-radius:20px;
+}
+
+.pop-meta{
+    font-size:11.5px;
+    color:var(--muted);
+}
+"""
+
+# Collapse to one line with no newlines/indentation at all — Streamlit's
+# markdown renderer can misparse a multi-line <style> block (blank lines or
+# leading whitespace get read as markdown, not CSS). A single unbroken line
+# leaves nothing for it to misinterpret.
+st.markdown(
+    "<style>" + " ".join(_CSS.split()) + "</style>",
+    unsafe_allow_html=True
 )
-
-st.markdown("""
-<div class="hero">
-<h1>🎵 MUSICALLY</h1>
-<p>Discover songs with similar audio characteristics instantly.</p>
-</div>
-""", unsafe_allow_html=True)
 
 feature_columns = [
     "danceability",
@@ -96,46 +269,71 @@ feature_columns = [
     "duration_ms"
 ]
 
-col1,col2,col3,col4=st.columns(4)
+# ---------- Hero ----------
+st.markdown(f"""
+<div class="hero">
+  <div>
+    <p class="hero-title">MUSICALLY</p>
+    <p class="hero-sub">Find your next favourite song by sound, not just genre — matched on tempo, energy, mood and ten other audio traits.</p>
+  </div>
+  <div class="hero-mark">🎧</div>
+</div>
+""", unsafe_allow_html=True)
 
-col1.metric("🎵 Songs", f"{len(df):,}")
-col2.metric("🎼 Genres", df.track_genre.nunique())
-col3.metric("📂 Clusters", df.cluster.nunique())
-col4.metric("🎧 Features", len(feature_columns))
+# ---------- Stat strip ----------
+st.markdown(f"""
+<div class="stat-strip">
+  <div class="stat-lead">
+    <div class="stat-num">{len(df):,}</div>
+    <div class="stat-label">songs in the library</div>
+  </div>
+  <div class="stat-minor">
+    <div class="stat-num">{df.track_genre.nunique()}</div>
+    <div class="stat-label">genres</div>
+  </div>
+  <div class="stat-minor">
+    <div class="stat-num">{df.cluster.nunique()}</div>
+    <div class="stat-label">sound clusters</div>
+  </div>
+  <div class="stat-minor">
+    <div class="stat-num">{len(feature_columns)}</div>
+    <div class="stat-label">audio features</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-st.sidebar.title("🎵 MUSICALLY")
+# ---------- Sidebar ----------
+st.sidebar.markdown("""
+<div class="sidebar-title">🎵 MUSICALLY</div>
+<div class="sidebar-sub">Content-based recommendation</div>
+""", unsafe_allow_html=True)
 
-st.sidebar.success("Content-Based Recommendation")
-
-st.sidebar.divider()
-
-st.sidebar.metric("Songs", len(df))
+st.sidebar.metric("Songs", f"{len(df):,}")
 st.sidebar.metric("Genres", df.track_genre.nunique())
 st.sidebar.metric("Clusters", df.cluster.nunique())
 
 st.sidebar.divider()
 
 st.sidebar.markdown("""
-### ⚙️ Model
+<p style="font-size:13px;color:var(--muted);margin-bottom:2px;">How it matches songs</p>
+<div class="chip-row">
+  <span class="chip">Global nearest-neighbour</span>
+  <span class="chip">Cosine similarity</span>
+  <span class="chip">Genre-aware filtering</span>
+  <span class="chip">Popularity re-ranking</span>
+  <span class="chip">Artist-diversity cap</span>
+</div>
+""", unsafe_allow_html=True)
 
-- Global Nearest-Neighbour Search
-- Cosine Similarity
-- Genre-aware filtering
-- Popularity re-ranking
-- Artist-diversity cap
-- StandardScaler
-- 10 Audio Features
-""")
-
-
-st.markdown("## 🔎 Search Filters")
+# ---------- Search filters ----------
+st.markdown("### 🔎 Find a song")
 left,right=st.columns(2)
 
 with left:
 
     genre=st.selectbox(
 
-        "🎼 Genre",
+        "Genre",
 
         ["All"]+sorted(df.track_genre.unique())
 
@@ -149,9 +347,7 @@ if genre!="All":
         filtered.track_genre==genre
     ]
 
-with right:
-
-    filtered = filtered.copy()
+filtered = filtered.copy()
 
 filtered["display"] = (
     filtered["track_name"]
@@ -159,12 +355,38 @@ filtered["display"] = (
     + filtered["artists"]
 )
 
+with right:
+
+    search_term = st.text_input(
+        "Search song",
+        placeholder="Start typing a song or artist name..."
+    )
+
+# Rendering every song in one dropdown freezes the browser tab — search first,
+# then only ever show a short matching list.
+MAX_OPTIONS = 200
+
+if not search_term:
+    st.info("👆 Start typing above to search the song library.")
+    st.stop()
+
+matches = filtered[
+    filtered["display"].str.contains(search_term, case=False, na=False)
+]
+
+if matches.empty:
+    st.warning("No songs match that search — try a different spelling.")
+    st.stop()
+
+if len(matches) > MAX_OPTIONS:
+    st.caption(
+        f"Showing {MAX_OPTIONS} of {len(matches):,} matches — narrow your search for more precise results."
+    )
+    matches = matches.iloc[:MAX_OPTIONS]
+
 selected = st.selectbox(
-
-    "🎵 Search Song",
-
-    sorted(filtered["display"])
-
+    "Choose a song",
+    sorted(matches["display"])
 )
 
 selected_row = filtered[
@@ -176,7 +398,7 @@ selected_artist = selected_row["artists"]
 
 top_n = st.slider(
 
-"Number of Recommendations",
+"Number of recommendations",
 
 5,
 
@@ -284,66 +506,75 @@ def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, max_
 if recommend_clicked:
 
     with st.spinner("Finding similar songs... 🎵"):
+
+        if stay_in_genre:
+            # If no specific genre was picked in the filter, restrict to the
+            # chosen song's own genre instead — otherwise "stay in genre"
+            # silently did nothing whenever Genre was left on "All".
+            restrict_to = genre if genre != "All" else selected_row["track_genre"]
+        else:
+            restrict_to = None
+
         songs=recommend(
         selected_song,
         top_n,
-        restrict_genre=genre if stay_in_genre else None
+        restrict_genre=restrict_to
     )
 
-    cols=st.columns(3)
+    if not songs:
+        st.warning("Couldn't find that song in the dataset.")
+    else:
+        st.markdown(f"### ✨ Because you liked *{selected_song}*")
 
-    for idx,(row,score) in enumerate(songs):
+        if restrict_to:
+            st.caption(f"Searching within genre: **{restrict_to}**")
+        else:
+            st.caption("Searching across **all genres**")
 
-        image = get_album_cover(
-    row.track_name,
-    row.artists
-)
-        if not image:
-            image = DEFAULT_IMAGE
+        cards_html = ['<div class="rec-grid">']
 
-        with cols[idx%3]:
+        for row, score in songs:
 
-            if image:
+            image = get_album_cover(row.track_name, row.artists)
+            if not image:
+                image = DEFAULT_IMAGE
 
-                st.image(
-                    image,
-                    use_container_width=True
-                )
+            match_pct = min(int(round(score * 100)), 99)
 
-            else:
-
-                st.image(
-                    DEFAULT_IMAGE,
-                    use_container_width=True
-                )
-            st.progress(min(float(score),1.0))
-            st.caption(
-    f"Match Score : {score*100:.0f}"
-)
-            st.markdown(f"""
-<div class="card">
-
-<h4>{row.track_name}</h4>
-
-<p>👤 <b>{row.artists}</b></p>
-
-<p>🎼 {row.track_genre}</p>
-
-<p>⭐ Popularity : {row.popularity}</p>
-
+            cards_html.append(f"""
+<div class="poster-card">
+  <div class="poster-image" style="background-image:url('{image}')">
+    <div class="poster-badge">{match_pct} match</div>
+    <div class="poster-scrim">
+      <h4>{row.track_name}</h4>
+      <p>{row.artists}</p>
+    </div>
+  </div>
+  <div class="poster-meta">
+    <span class="genre-chip">{row.track_genre}</span>
+    <span class="pop-meta">⭐ {row.popularity} popularity</span>
+  </div>
 </div>
-""", unsafe_allow_html=True)
+""")
+
+        cards_html.append('</div>')
+
+        st.markdown("".join(cards_html), unsafe_allow_html=True)
+
+        if st.session_state.get("_cover_error"):
+            with st.expander("⚠️ Album art isn't loading — why?"):
+                st.code(st.session_state["_cover_error"])
 
 st.divider()
 
 st.markdown("""
-<div style="text-align:center;color:gray">
+<div style="text-align:center;color:var(--muted);font-size:13px;">
 
-Built using Streamlit • KMeans • Spotify API
+Built using Streamlit • Global nearest-neighbour matching • Spotify API
 
 <br><br>
 
-Developed by <b>Anshika Jain</b>
+Developed by <b style="color:var(--text);">Anshika Jain</b>
 
 </div>
 """, unsafe_allow_html=True)
