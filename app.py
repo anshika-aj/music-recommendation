@@ -4,7 +4,7 @@ import numpy as np
 import joblib
 from spotify_api import get_album_cover
 from sklearn.metrics.pairwise import cosine_similarity
-from utils.feedback import log_feedback, relevance_rate
+from utils.feedback import log_feedback, relevance_rate, song_relevance_stats
 
 # Tag for every feedback record — matches the "Global cosine similarity"
 # strategy name used in docs/03_solution.md. Update this if/when a second
@@ -443,7 +443,35 @@ def get_scaled_features():
 
 X_scaled = get_scaled_features()
 
-def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, max_per_artist=2):
+@st.cache_data(ttl=60)
+def get_feedback_stats():
+    # Cached for 60s: song_relevance_stats() hits the Supabase DB, and
+    # recommend() can run on every search — no need to re-query on every
+    # keystroke. A minute-old view of feedback is fine for a re-rank nudge.
+    return song_relevance_stats()
+
+def apply_feedback_boost(pool_df, similarity):
+    """
+    Nudge similarity scores using historical evaluator feedback.
+
+    A song with a good track record of 👍 across past queries gets pushed
+    up; a song evaluators consistently marked 👎 gets pushed down. Songs
+    with no feedback yet are left untouched (boost = 0) — this only
+    reweights among songs that already have evidence behind them, it
+    never invents relevance for songs no one has judged.
+    """
+    stats = get_feedback_stats()
+    if stats.empty:
+        return np.zeros(len(pool_df))
+
+    labels = pool_df["track_name"] + " — " + pool_df["artists"]
+    # relevance_rate is 0..1; center it at 0 so "no signal" truly means
+    # no signal (0), a mostly-👍 song pulls scores up, mostly-👎 pulls down.
+    rate_by_song = stats.set_index("recommended_song")["relevance_rate"]
+    boost = labels.map(rate_by_song) - 0.5
+    return boost.fillna(0.0).to_numpy()
+
+def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, feedback_weight=0.05, max_per_artist=2):
     """
     Global nearest-neighbour recommender — no KMeans gate.
 
@@ -451,6 +479,9 @@ def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, max_
                           None/"All" for a full-dataset search.
     popularity_weight   : small re-rank nudge on top of audio similarity, not
                           a popularity recommender.
+    feedback_weight      : small re-rank nudge from historical evaluator
+                          feedback (see apply_feedback_boost). Set to 0 to
+                          fall back to pure similarity + popularity ranking.
     max_per_artist      : caps how many songs from one artist can appear in
                           the results (artist-diversity constraint).
     """
@@ -481,7 +512,14 @@ def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, max_
     pop_range = pop.max() - pop.min()
     pop_norm = (pop - pop.min()) / pop_range if pop_range > 0 else np.zeros_like(pop)
 
-    final_score = (1 - popularity_weight) * similarity + popularity_weight * pop_norm
+    feedback_boost = apply_feedback_boost(pool_df, similarity)
+
+    base_weight = 1 - popularity_weight - feedback_weight
+    final_score = (
+        base_weight * similarity
+        + popularity_weight * pop_norm
+        + feedback_weight * feedback_boost
+    )
 
     order = np.argsort(-final_score)
 
