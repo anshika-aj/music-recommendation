@@ -7,3 +7,4 @@ plotly
 joblib
 requests
 spotipy
+supabase
