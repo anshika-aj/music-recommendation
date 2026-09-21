@@ -4,6 +4,12 @@ import numpy as np
 import joblib
 from spotify_api import get_album_cover
 from sklearn.metrics.pairwise import cosine_similarity
+from utils.feedback import log_feedback, relevance_rate
+
+# Tag for every feedback record — matches the "Global cosine similarity"
+# strategy name used in docs/03_solution.md. Update this if/when a second
+# strategy (e.g. genre-filtered, hybrid) is added alongside this one.
+CURRENT_STRATEGY = "global_cosine"
 
 st.set_page_config(
     page_title="Music recommender: MUSICALLY",
@@ -325,6 +331,13 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+st.sidebar.divider()
+evaluator_id = st.sidebar.text_input(
+    "Evaluator ID",
+    value="evaluator_01",
+    help="Tags every 👍/👎 you give so feedback can be traced back to who gave it."
+)
+
 # ---------- Search filters ----------
 st.markdown("### 🔎 Find a song")
 left,right=st.columns(2)
@@ -521,27 +534,48 @@ if recommend_clicked:
         restrict_genre=restrict_to
     )
 
+    # Stored in session_state rather than used directly: clicking a 👍/👎
+    # button below triggers a Streamlit rerun, and recommend_clicked (a
+    # plain st.button) would go back to False on that rerun, wiping the
+    # results out from under the person mid-vote if we didn't persist them.
+    st.session_state["current_songs"] = songs
+    st.session_state["current_query_display"] = selected
+    st.session_state["current_selected_song"] = selected_song
+    st.session_state["current_restrict_to"] = restrict_to
+
+if "current_songs" in st.session_state:
+
+    songs = st.session_state["current_songs"]
+    restrict_to = st.session_state["current_restrict_to"]
+
     if not songs:
         st.warning("Couldn't find that song in the dataset.")
     else:
-        st.markdown(f"### ✨ Because you liked *{selected_song}*")
+        st.markdown(f"### ✨ Because you liked *{st.session_state['current_selected_song']}*")
 
         if restrict_to:
             st.caption(f"Searching within genre: **{restrict_to}**")
         else:
             st.caption("Searching across **all genres**")
 
-        cards_html = ['<div class="rec-grid">']
+        # Cards render through st.columns (not one big HTML grid) so the
+        # 👍/👎 buttons underneath are real Streamlit widgets — raw HTML
+        # <button> tags inside an st.markdown block can't trigger a Python
+        # callback, so a single injected grid can't carry working feedback.
+        N_COLS = 4
+        song_rows = [songs[i:i + N_COLS] for i in range(0, len(songs), N_COLS)]
 
-        for row, score in songs:
+        for song_row in song_rows:
+            cols = st.columns(N_COLS)
+            for col, (row, score) in zip(cols, song_row):
+                with col:
+                    image = get_album_cover(row.track_name, row.artists)
+                    if not image:
+                        image = DEFAULT_IMAGE
 
-            image = get_album_cover(row.track_name, row.artists)
-            if not image:
-                image = DEFAULT_IMAGE
+                    match_pct = min(int(round(score * 100)), 99)
 
-            match_pct = min(int(round(score * 100)), 99)
-
-            cards_html.append(f"""
+                    st.markdown(f"""
 <div class="poster-card">
   <div class="poster-image" style="background-image:url('{image}')">
     <div class="poster-badge">{match_pct} match</div>
@@ -555,15 +589,41 @@ if recommend_clicked:
     <span class="pop-meta">⭐ {row.popularity} popularity</span>
   </div>
 </div>
-""")
+""", unsafe_allow_html=True)
 
-        cards_html.append('</div>')
+                    song_key = f"{row.track_name}_{row.artists}".replace(" ", "_")
+                    recommended_song_label = f"{row.track_name} — {row.artists}"
 
-        st.markdown("".join(cards_html), unsafe_allow_html=True)
+                    fb_up, fb_down = st.columns(2)
+                    if fb_up.button("👍", key=f"up_{song_key}", use_container_width=True):
+                        log_feedback(
+                            query_song=st.session_state["current_query_display"],
+                            strategy=CURRENT_STRATEGY,
+                            recommended_song=recommended_song_label,
+                            vote="relevant",
+                            evaluator=evaluator_id,
+                        )
+                        st.toast("Feedback recorded ✅")
+                    if fb_down.button("👎", key=f"down_{song_key}", use_container_width=True):
+                        log_feedback(
+                            query_song=st.session_state["current_query_display"],
+                            strategy=CURRENT_STRATEGY,
+                            recommended_song=recommended_song_label,
+                            vote="not_relevant",
+                            evaluator=evaluator_id,
+                        )
+                        st.toast("Feedback recorded ✅")
 
         if st.session_state.get("_cover_error"):
             with st.expander("⚠️ Album art isn't loading — why?"):
                 st.code(st.session_state["_cover_error"])
+
+        with st.expander("📊 Aggregate relevance so far (all evaluators)"):
+            agg = relevance_rate()
+            if agg.empty:
+                st.caption("No feedback logged yet — vote 👍/👎 above to populate this.")
+            else:
+                st.dataframe(agg, use_container_width=True, hide_index=True)
 
 st.divider()
 

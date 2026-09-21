@@ -1,0 +1,7 @@
+query_song,strategy,recommended_song,vote,evaluator,timestamp
+Aaftaab — The Local Train,global_cosine,Baarishein — Anuv Jain,relevant,evaluator_01,21-09-2026 07:49
+Aaftaab — The Local Train,global_cosine,Lamhe — Raghav Chaitanya,relevant,evaluator_01,21-09-2026 07:49
+Aaftaab — The Local Train,global_cosine,Channa Mereya - Unplugged — Pritam;Arijit Singh,relevant,evaluator_01,21-09-2026 07:49
+Aaftaab — The Local Train,global_cosine,Gul — Anuv Jain,relevant,evaluator_01,21-09-2026 07:50
+Aaftaab — The Local Train,global_cosine,Naina — Pritam;Arijit Singh,relevant,evaluator_01,21-09-2026 07:50
+Aaftaab — The Local Train,global_cosine,Arcade X Dil Ko Karaar Aaya — Pranish VP,not_relevant,evaluator_01,21-09-2026 07:50
