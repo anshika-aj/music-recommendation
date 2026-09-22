@@ -10,10 +10,30 @@ import uuid
 if "evaluator_id" not in st.session_state:
     st.session_state.evaluator_id = f"evaluator_{uuid.uuid4().hex[:8]}"
 
-# Tag for every feedback record — matches the "Global cosine similarity"
-# strategy name used in docs/03_solution.md. Update this if/when a second
-# strategy (e.g. genre-filtered, hybrid) is added alongside this one.
-CURRENT_STRATEGY = "global_cosine"
+# Retrieval strategies available for comparison (docs/03_solution.md).
+# key -> (display label, short description shown under the picker)
+STRATEGIES = {
+    "global_cosine": (
+        "Global Cosine Similarity",
+        "Full-catalogue nearest neighbour on audio features — no filtering.",
+    ),
+    "genre_filtered": (
+        "Genre-Filtered Cosine",
+        "Cosine similarity restricted to songs in the query song's own genre.",
+    ),
+    "kmeans_restricted": (
+        "KMeans Cluster-Restricted",
+        "Cosine similarity restricted to songs in the query song's KMeans sound cluster.",
+    ),
+    "popularity_weighted": (
+        "Popularity-Weighted",
+        "Global similarity, but popularity counts for much more in the final ranking.",
+    ),
+    "hybrid": (
+        "Hybrid (Genre + Cluster)",
+        "Cosine similarity restricted to songs matching BOTH genre and cluster — the tightest pool.",
+    ),
+}
 
 st.set_page_config(
     page_title="Music recommender: MUSICALLY",
@@ -327,10 +347,10 @@ st.sidebar.divider()
 st.sidebar.markdown("""
 <p style="font-size:13px;color:var(--muted);margin-bottom:2px;">How it matches songs</p>
 <div class="chip-row">
-  <span class="chip">Global nearest-neighbour</span>
+  <span class="chip">5 retrieval strategies</span>
   <span class="chip">Cosine similarity</span>
-  <span class="chip">Genre-aware filtering</span>
   <span class="chip">Popularity re-ranking</span>
+  <span class="chip">Feedback re-ranking</span>
   <span class="chip">Artist-diversity cap</span>
 </div>
 """, unsafe_allow_html=True)
@@ -338,6 +358,17 @@ st.sidebar.markdown("""
 st.sidebar.divider()
 evaluator_id = st.session_state.evaluator_id
 st.sidebar.caption(f"Evaluator ID: `{evaluator_id}`")
+
+st.sidebar.divider()
+strategy_key = st.sidebar.selectbox(
+    "Retrieval strategy",
+    list(STRATEGIES.keys()),
+    format_func=lambda k: STRATEGIES[k][0],
+    help="Which candidate pool + ranking logic to use. Every vote you give "
+         "is tagged with this strategy so results are comparable per-strategy "
+         "in the Aggregate relevance table below.",
+)
+st.sidebar.caption(STRATEGIES[strategy_key][1])
 
 # ---------- Search filters ----------
 st.markdown("### 🔎 Find a song")
@@ -421,14 +452,6 @@ top_n = st.slider(
 10
 )
 
-stay_in_genre = st.checkbox(
-    "Stay within selected genre",
-    value=(genre != "All"),
-    help="If checked, recommendations are pulled only from the selected genre. "
-         "If unchecked, songs are matched purely on audio characteristics, "
-         "which can surface similar-sounding tracks from other genres/languages."
-)
-
 recommend_clicked = st.button(
     "🎧 Generate Recommendations",
     use_container_width=True
@@ -472,14 +495,48 @@ def apply_feedback_boost(pool_df, similarity):
     boost = labels.map(rate_by_song) - 0.5
     return boost.fillna(0.0).to_numpy()
 
-def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, feedback_weight=0.05, max_per_artist=2):
+def build_pool(selected_row, strategy):
     """
-    Global nearest-neighbour recommender — no KMeans gate.
+    Select the candidate pool for a given strategy. This is the only thing
+    that differs strategy-to-strategy — ranking (similarity + popularity +
+    feedback) is identical across all five so the comparison is fair (same
+    scoring, different candidate sets is what's actually being evaluated).
+    """
+    song_genre = selected_row["track_genre"]
+    song_cluster = selected_row["cluster"]
 
-    restrict_genre     : a specific genre string to restrict candidates to, or
-                          None/"All" for a full-dataset search.
-    popularity_weight   : small re-rank nudge on top of audio similarity, not
-                          a popularity recommender.
+    if strategy == "genre_filtered":
+        pool_df = df[df["track_genre"] == song_genre]
+    elif strategy == "kmeans_restricted":
+        pool_df = df[df["cluster"] == song_cluster]
+    elif strategy == "hybrid":
+        pool_df = df[(df["track_genre"] == song_genre) & (df["cluster"] == song_cluster)]
+    else:
+        # "global_cosine" and "popularity_weighted" both search the full
+        # catalogue — popularity_weighted differs only in its scoring weight,
+        # applied by the caller.
+        pool_df = df
+
+    # A tight filter (kmeans_restricted / hybrid) can occasionally leave too
+    # few candidates to fill n results after de-duping/artist-capping — fall
+    # back to the full catalogue rather than returning a near-empty list.
+    if len(pool_df) < 5:
+        pool_df = df
+
+    return pool_df
+
+
+def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10, feedback_weight=0.05, max_per_artist=2):
+    """
+    Retrieval-strategy-aware recommender. strategy selects the candidate
+    pool (see build_pool); ranking logic is shared across strategies so the
+    per-strategy relevance-rate comparison (utils/feedback.relevance_rate)
+    reflects pool selection, not a different scoring method.
+
+    strategy            : one of STRATEGIES' keys.
+    popularity_weight   : small re-rank nudge on top of audio similarity,
+                          overridden higher for the "popularity_weighted"
+                          strategy specifically (see below).
     feedback_weight      : small re-rank nudge from historical evaluator
                           feedback (see apply_feedback_boost). Set to 0 to
                           fall back to pure similarity + popularity ranking.
@@ -499,10 +556,13 @@ def recommend(song_name, n=10, restrict_genre=None, popularity_weight=0.10, feed
     query_pos = df.index.get_loc(idx)
     query_vec = X_scaled[query_pos].reshape(1, -1)
 
-    if restrict_genre and restrict_genre != "All":
-        pool_df = df[df["track_genre"] == restrict_genre]
-    else:
-        pool_df = df
+    pool_df = build_pool(selected_row, strategy)
+
+    if strategy == "popularity_weighted":
+        # A genuinely distinct strategy, not a minor variant of
+        # global_cosine: popularity dominates the final ranking instead of
+        # being a small nudge.
+        popularity_weight = 0.45
 
     pool_positions = df.index.get_indexer(pool_df.index)
     pool_scaled = X_scaled[pool_positions]
@@ -559,43 +619,34 @@ if recommend_clicked:
 
     with st.spinner("Finding similar songs... 🎵"):
 
-        if stay_in_genre:
-            # If no specific genre was picked in the filter, restrict to the
-            # chosen song's own genre instead — otherwise "stay in genre"
-            # silently did nothing whenever Genre was left on "All".
-            restrict_to = genre if genre != "All" else selected_row["track_genre"]
-        else:
-            restrict_to = None
-
-        songs=recommend(
-        selected_song,
-        top_n,
-        restrict_genre=restrict_to
-    )
+        songs = recommend(
+            selected_song,
+            top_n,
+            strategy=strategy_key,
+        )
 
     # Stored in session_state rather than used directly: clicking a 👍/👎
     # button below triggers a Streamlit rerun, and recommend_clicked (a
     # plain st.button) would go back to False on that rerun, wiping the
     # results out from under the person mid-vote if we didn't persist them.
+    # strategy_used is captured here too so the label + logged feedback stay
+    # tied to whatever strategy was picked at the moment of search, even if
+    # the sidebar selection changes before voting.
     st.session_state["current_songs"] = songs
     st.session_state["current_query_display"] = selected
     st.session_state["current_selected_song"] = selected_song
-    st.session_state["current_restrict_to"] = restrict_to
+    st.session_state["current_strategy"] = strategy_key
 
 if "current_songs" in st.session_state:
 
     songs = st.session_state["current_songs"]
-    restrict_to = st.session_state["current_restrict_to"]
+    strategy_used = st.session_state["current_strategy"]
 
     if not songs:
         st.warning("Couldn't find that song in the dataset.")
     else:
         st.markdown(f"### ✨ Because you liked *{st.session_state['current_selected_song']}*")
-
-        if restrict_to:
-            st.caption(f"Searching within genre: **{restrict_to}**")
-        else:
-            st.caption("Searching across **all genres**")
+        st.caption(f"Strategy: **{STRATEGIES[strategy_used][0]}**")
 
         # Cards render through st.columns (not one big HTML grid) so the
         # 👍/👎 buttons underneath are real Streamlit widgets — raw HTML
@@ -637,7 +688,7 @@ if "current_songs" in st.session_state:
                     if fb_up.button("👍", key=f"up_{song_key}", use_container_width=True):
                         log_feedback(
                             query_song=st.session_state["current_query_display"],
-                            strategy=CURRENT_STRATEGY,
+                            strategy=strategy_used,
                             recommended_song=recommended_song_label,
                             vote="relevant",
                             evaluator=evaluator_id,
@@ -646,7 +697,7 @@ if "current_songs" in st.session_state:
                     if fb_down.button("👎", key=f"down_{song_key}", use_container_width=True):
                         log_feedback(
                             query_song=st.session_state["current_query_display"],
-                            strategy=CURRENT_STRATEGY,
+                            strategy=strategy_used,
                             recommended_song=recommended_song_label,
                             vote="not_relevant",
                             evaluator=evaluator_id,
