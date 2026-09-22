@@ -5,6 +5,10 @@ import joblib
 from spotify_api import get_album_cover
 from sklearn.metrics.pairwise import cosine_similarity
 from utils.feedback import log_feedback, relevance_rate, song_relevance_stats
+import uuid
+
+if "evaluator_id" not in st.session_state:
+    st.session_state.evaluator_id = f"evaluator_{uuid.uuid4().hex[:8]}"
 
 # Tag for every feedback record — matches the "Global cosine similarity"
 # strategy name used in docs/03_solution.md. Update this if/when a second
@@ -332,11 +336,8 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 st.sidebar.divider()
-evaluator_id = st.sidebar.text_input(
-    "Evaluator ID",
-    value="evaluator_01",
-    help="Tags every 👍/👎 you give so feedback can be traced back to who gave it."
-)
+evaluator_id = st.session_state.evaluator_id
+st.sidebar.caption(f"Evaluator ID: `{evaluator_id}`")
 
 # ---------- Search filters ----------
 st.markdown("### 🔎 Find a song")
