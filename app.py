@@ -4,7 +4,8 @@ import numpy as np
 import joblib
 from spotify_api import get_album_cover
 from sklearn.metrics.pairwise import cosine_similarity
-from utils.feedback import log_feedback, relevance_rate, song_relevance_stats
+from utils.feedback import log_feedback, load_feedback, relevance_rate
+from utils.reranker import get_learned_boost, MIN_FEEDBACK_FOR_MODEL
 import uuid
 
 if "evaluator_id" not in st.session_state:
@@ -468,32 +469,44 @@ def get_scaled_features():
 X_scaled = get_scaled_features()
 
 @st.cache_data(ttl=60)
-def get_feedback_stats():
-    # Cached for 60s: song_relevance_stats() hits the Supabase DB, and
-    # recommend() can run on every search — no need to re-query on every
-    # keystroke. A minute-old view of feedback is fine for a re-rank nudge.
-    return song_relevance_stats()
+def get_feedback_df():
+    # Cached for 60s: reused by the learned re-ranker, the heuristic
+    # fallback, and the aggregate relevance table below — one Supabase
+    # query serves all three instead of one each.
+    return load_feedback()
 
-def apply_feedback_boost(pool_df, similarity):
+def apply_feedback_boost(pool_df, pool_scaled, similarity):
     """
-    Nudge similarity scores using historical evaluator feedback.
+    Boost the pool's ranking using real evaluator feedback.
 
-    A song with a good track record of 👍 across past queries gets pushed
-    up; a song evaluators consistently marked 👎 gets pushed down. Songs
-    with no feedback yet are left untouched (boost = 0) — this only
-    reweights among songs that already have evidence behind them, it
-    never invents relevance for songs no one has judged.
+    Once there is enough labeled feedback (utils.reranker.MIN_FEEDBACK_FOR_MODEL
+    rows, with both relevant and not_relevant votes present), a logistic
+    regression trained on that feedback (audio features -> relevant/not)
+    supplies the boost — it learns which audio traits evaluators actually
+    respond to, instead of us guessing a fixed weight.
+
+    Below that threshold, falls back to the original heuristic: a song's
+    own historical relevance rate across past votes, centered at 0 so "no
+    feedback yet" truly means no nudge either way.
+
+    Returns (boost_array, used_learned_model: bool) — the bool is only
+    used to show an honest status caption in the UI, not for scoring.
     """
-    stats = get_feedback_stats()
-    if stats.empty:
-        return np.zeros(len(pool_df))
+    feedback_df = get_feedback_df()
+
+    boost, used_model = get_learned_boost(feedback_df, pool_scaled, df, X_scaled)
+    if used_model:
+        return boost - 0.5, True
+
+    if feedback_df.empty:
+        return np.zeros(len(pool_df)), False
 
     labels = pool_df["track_name"] + " — " + pool_df["artists"]
-    # relevance_rate is 0..1; center it at 0 so "no signal" truly means
-    # no signal (0), a mostly-👍 song pulls scores up, mostly-👎 pulls down.
-    rate_by_song = stats.set_index("recommended_song")["relevance_rate"]
+    rate_by_song = feedback_df.groupby("recommended_song")["vote"].apply(
+        lambda votes: (votes == "relevant").mean()
+    )
     boost = labels.map(rate_by_song) - 0.5
-    return boost.fillna(0.0).to_numpy()
+    return boost.fillna(0.0).to_numpy(), False
 
 def build_pool(selected_row, strategy):
     """
@@ -573,7 +586,8 @@ def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10,
     pop_range = pop.max() - pop.min()
     pop_norm = (pop - pop.min()) / pop_range if pop_range > 0 else np.zeros_like(pop)
 
-    feedback_boost = apply_feedback_boost(pool_df, similarity)
+    feedback_boost, reranker_active = apply_feedback_boost(pool_df, pool_scaled, similarity)
+    st.session_state["_reranker_active"] = reranker_active
 
     base_weight = 1 - popularity_weight - feedback_weight
     final_score = (
@@ -648,6 +662,15 @@ if "current_songs" in st.session_state:
         st.markdown(f"### ✨ Because you liked *{st.session_state['current_selected_song']}*")
         st.caption(f"Strategy: **{STRATEGIES[strategy_used][0]}**")
 
+        fb_count = len(get_feedback_df())
+        if st.session_state.get("_reranker_active"):
+            st.caption(f"🧠 Learned re-ranker active — trained on {fb_count} votes")
+        else:
+            st.caption(
+                f"📊 Using heuristic feedback boost — {fb_count}/{MIN_FEEDBACK_FOR_MODEL} "
+                "votes needed (with both 👍 and 👎 present) before the learned re-ranker activates"
+            )
+
         # Cards render through st.columns (not one big HTML grid) so the
         # 👍/👎 buttons underneath are real Streamlit widgets — raw HTML
         # <button> tags inside an st.markdown block can't trigger a Python
@@ -709,7 +732,7 @@ if "current_songs" in st.session_state:
                 st.code(st.session_state["_cover_error"])
 
         with st.expander("📊 Aggregate relevance so far (all evaluators)"):
-            agg = relevance_rate()
+            agg = relevance_rate(get_feedback_df())
             if agg.empty:
                 st.caption("No feedback logged yet — vote 👍/👎 above to populate this.")
             else:
