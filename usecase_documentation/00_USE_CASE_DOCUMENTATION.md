@@ -1,173 +1,184 @@
-# MUSICALLY — Use Case Addition: Recommendation Strategy Evaluation
+# MUSICALLY — Use Case: Recommendation Strategy Evaluation
 
 **Project:** MUSICALLY — Content-Based Music Recommendation System
-**Document purpose:** Document the addition of a new use case — evaluating
-multiple recommendation retrieval strategies against a controlled synthetic
-dataset — to the existing system, including the trigger, the pipeline
-change, the full PRD cycle, technical implementation, and the feedback
-loop this creates going forward.
+**Document purpose:** Full record of turning a single-strategy recommender
+into a retrieval-strategy evaluation tool — the trigger, the PRD cycle,
+what was actually built, the bugs found and fixed along the way, and the
+feedback loop now driving what gets built next.
+
+> This document reflects the **current, deployed state** of the project,
+> not a plan. Every claim below is either live in the app or explicitly
+> marked as not yet reached.
 
 ---
 
-## 1. Trigger — Why This Change Is Needed Now
+## 1. Trigger — Why This Change Was Needed
 
-The existing MUSICALLY system is a working content-based recommender:
-audio features from a ~80k song dataset are scaled, clustered with KMeans,
-and a single ranked list is returned via cosine similarity for a chosen
-seed song, served through a Streamlit app.
+The original MUSICALLY was a working content-based recommender: audio
+features from a public Kaggle dataset (~81k real Spotify tracks, not
+synthetic data — see note below) scaled and compared with cosine
+similarity, with KMeans used for exploratory clustering only, served
+through a Streamlit app.
 
-Two review points converged to trigger this addition:
+Two review points converged to trigger this change:
 
-1. **Positioning gap.** Framed as a consumer product, the natural question
-   is "why use this instead of Spotify?" — and at 80k songs with no
-   licensing or infrastructure behind it, there's no honest answer to that.
-   The system's actual strength isn't consumer-scale discovery; it's that
-   the retrieval logic is transparent and swappable, which is exactly what
-   a team deciding *how* to build a recommender at scale needs to test
-   before committing engineering time to one approach.
+1. **Positioning gap.** Framed as a consumer product, the obvious question
+   is "why use this instead of Spotify?" — and with ~81k tracks and no
+   licensing or infrastructure behind it, there's no honest answer. The
+   system's real strength is that its retrieval logic is transparent and
+   swappable — exactly what a team deciding *how* to build a recommender
+   at scale needs to test before committing engineering time.
 
-2. **No evidence behind the current strategy.** The system currently runs
-   exactly one retrieval strategy (KMeans cluster-restricted) with no
-   mechanism to check whether it's actually the best available option.
-   Any decision to keep it, replace it, or combine it with another
-   approach has so far been made without data.
+2. **No evidence behind any one strategy.** Only one retrieval approach was
+   implemented, with no mechanism to check whether it was actually the
+   best option available.
 
-Both issues are solved by the same change: repurpose MUSICALLY from a
-single-output recommender into a **strategy evaluation tool** — a
-controlled environment where multiple retrieval strategies can be run
-against identical queries and compared, generating the evidence needed to
-decide what to build against a real catalog.
+Both are solved by the same change: repurpose MUSICALLY into a
+**strategy evaluation tool** — multiple retrieval strategies run against
+the same queries, compared using real evaluator feedback, generating
+evidence instead of guesswork.
+
+**Note on the dataset:** this is the public Kaggle "114k Spotify Tracks"
+dataset — real audio-feature values (danceability, energy, valence, etc.)
+for real, named tracks, pulled from Spotify's now-deprecated Audio
+Features API before it shut down for new apps in Nov 2024. It is **not**
+synthetic/fake data. It's a fixed subset (114 genres × 1,000 tracks,
+~81k unique after de-duplication) rather than Spotify's full catalog —
+that's the actual scale limitation, and it's a licensing/availability
+limit, not a data-quality one. (Earlier drafts of these docs incorrectly
+called this "synthetic" — corrected throughout.)
 
 ---
 
-## 2. Pipeline Comparison — Existing vs Proposed
+## 2. Pipeline: Before → Now
 
-![Pipeline comparison](images/pipeline_comparison.png)
+```mermaid
+flowchart TB
+    subgraph OLD["OLD — single strategy"]
+        direction TB
+        O1[User selects song] --> O2[Audio features + scaling]
+        O2 --> O3[Cosine similarity — full dataset only]
+        O3 --> O4[One ranked list]
+        O4 --> O5[Streamlit UI]
+    end
 
-| Aspect | Old pipeline | New pipeline |
+    subgraph NEW["NOW — 5-strategy comparison + feedback loop"]
+        direction TB
+        N1[User selects song + picks a strategy] --> N2[Audio features + scaling]
+        N2 --> N3{build_pool by strategy}
+        N3 --> N4a[global_cosine]
+        N3 --> N4b[genre_filtered]
+        N3 --> N4c[kmeans_restricted]
+        N3 --> N4d[popularity_weighted]
+        N3 --> N4e[hybrid]
+        N4a --> N5[Ranked list: similarity + popularity + feedback boost]
+        N4b --> N5
+        N4c --> N5
+        N4d --> N5
+        N4e --> N5
+        N5 --> N6[Streamlit UI + 👍/👎 per result]
+        N6 --> N7[(Supabase feedback table)]
+        N7 --> N8[Aggregate relevance-rate per strategy]
+        N7 --> N9[Learned re-ranker — active once 50+ votes]
+        N9 -.feeds back into.-> N5
+    end
+```
+
+| Aspect | Old pipeline | Current pipeline |
 |---|---|---|
-| Output per query | One ranked list | One list per strategy (KMeans-restricted, global cosine, genre-filtered), shown side by side |
-| Strategy | Fixed — KMeans cluster-restricted only | Pluggable — any strategy can be added as a module |
-| Feedback | None captured | Per-result, per-strategy 👍/👎, logged with evaluator and timestamp |
-| Evaluation | None — relevance was assumed | Aggregate relevance-rate per strategy, computed from logged feedback |
-| Who it's for | An end listener | An evaluator (team member) judging strategies before a build decision |
-| What it proves | That a recommendation can be generated | Which retrieval approach actually performs better, with evidence |
-
-The core architectural change is straightforward: the single retrieval
-function becomes three interchangeable strategy functions that all run
-against the same query, and a feedback-capture layer is added on top of
-what was previously a stateless display.
+| Strategies | One (global cosine, KMeans for analysis only) | Five: `global_cosine`, `genre_filtered`, `kmeans_restricted`, `popularity_weighted`, `hybrid` |
+| Strategy selection | N/A | Sidebar dropdown; every vote tagged with the strategy active when it was cast |
+| Feedback | None captured | Per-result 👍/👎, logged with `query_song, strategy, recommended_song, vote, evaluator, created_at` |
+| Feedback storage | N/A | Supabase (hosted Postgres) — survives app restarts/redeploys |
+| Evaluator identity | N/A | Auto-generated per-session ID (see §4 — this replaced a hardcoded-default bug) |
+| Using the feedback | N/A | (a) aggregate relevance-rate table per strategy, (b) a learned re-ranker that nudges future rankings once there's enough labeled data |
+| What it proves | That a recommendation can be generated | Which retrieval approach evaluators actually rate higher, with evidence — and, over time, which audio traits predict a "relevant" vote |
 
 ---
 
 ## 3. The Complete PRD Cycle
 
-This use case was taken through the full requirements-to-decision cycle,
-not built directly from an idea:
+**Client / Team → Requirements** — the trigger above was raised before any
+code changed (see `06_feature_cycle_walkthrough.md`).
 
-**Client / Team → Requirements**
-The trigger above was raised with the team in a structured format
-(requirement, current state, problem, alternative, trade-off,
-recommendation) before any code was changed — see `06_feature_cycle_walkthrough.md`
-for the full message. This avoided quietly changing the pipeline unilaterally.
+**Requirements → PRD** (`02_prd.md`) — target user redefined as "a team
+building a music platform," functional requirements written around
+running multiple strategies, per-result feedback, and aggregate reporting.
 
-**Requirements → PRD**
-Formalized in `02_prd.md`: target user redefined as "a team building a
-music platform," the use case rewritten around strategy evaluation rather
-than consumer discovery, and functional requirements added specifically
-for the comparison feature (run N strategies per query, side-by-side
-display, per-result feedback, aggregate reporting, fixed test-query set).
-Success criteria were deliberately written as *relative and qualitative*
-("evaluators can tell which strategy performs more consistently") rather
-than a fabricated accuracy percentage.
+**PRD → Solutioning** (`03_solution.md`) — architecture diagrammed, all 5
+strategies tabulated with what candidate pool each searches, and real
+implementation decisions (CSV → Supabase, the evaluator-ID bug, the
+single-dispatcher-function vs separate-strategy-files choice) worked
+through as Problem → Options → Trade-offs → Decision.
 
-**PRD → Solutioning**
-Documented in `03_solution.md`: the existing architecture was diagrammed,
-the strategies under comparison were tabulated, and the cluster-restriction
-issue was worked through as Problem → Options → Trade-offs → Decision,
-landing on "KMeans for analysis only, global similarity for retrieval" as
-the current default — one candidate among several, not a final answer.
+**Solutioning → Implementation** — all 5 strategies are live in the
+deployed app; feedback logging is live and Supabase-backed; the learned
+re-ranker module exists and is gated behind a real-data threshold.
 
-**Solutioning → Implementation**
-Concrete technical changes (Section 4 below) scoped directly from the PRD's
-functional requirements.
+**Implementation → Prototype → User Testing** — the app is deployed and
+usable now. Real evaluator votes are accumulating (a handful so far, all
+`global_cosine` — see `04_user_feedback.md` for the current count).
+Testing is ongoing, not finished.
 
-**Implementation → Prototype → User Testing**
-The comparison view will be implemented in Streamlit and tested against a fixed set of seed songs by evaluators. Their feedback will be logged in `04_user_feedback.md` — not simulated data.
-
-**User Testing → Feedback → Analyze → New Version**
-Aggregate results computed from logged feedback answer the PRD's success
-criteria directly and become the input to `05_final_report.md`'s
-recommendation for what to build at scale — closing the loop back to the
-team (Section 6 below).
+**User Testing → Feedback → Analyze → New Version** — once enough votes
+exist across all 5 strategies, `relevance_rate()` produces the real
+per-strategy comparison, and crossing 50 labeled votes with both 👍 and
+👎 present activates the learned re-ranker automatically. Both feed
+`05_final_report.md`.
 
 ---
 
-## 4. Technical Changes Required
+## 4. What Actually Got Built (and what broke, and got fixed)
 
-1. **Refactor the single retrieval function into pluggable strategy
-   modules.** Replace one `recommend(song)` function with a `strategies/`
-   package — `kmeans_strategy.py`, `global_cosine_strategy.py`,
-   `genre_filtered_strategy.py` — each accepting `(song, dataset)` and
-   returning results in an identical schema, so any module can be added or
-   removed without touching the app layer.
+This section exists because the honest version of "what I did" includes
+the mistakes caught along the way, not just the final code.
 
-2. **Change the output contract from a flat list to a keyed structure.**
-   `{"kmeans": [...], "global_cosine": [...], "genre_filtered": [...]}`
-   instead of a single list — this is what makes side-by-side display and
-   per-strategy feedback possible.
+1. **5 retrieval strategies**, dispatched from one `build_pool(selected_row, strategy)`
+   function in `app.py` rather than 5 separate strategy files as originally
+   planned in an earlier draft of this doc — with only 5 strategies and
+   shared ranking logic, one function with clear branches was simpler to
+   maintain than a `strategies/` package, without losing pluggability
+   (adding a 6th strategy is still a few lines, not a rewrite).
 
-3. **Introduce a feedback schema.**
-   A table (CSV or SQLite) with columns:
-   `query_song, strategy, recommended_song, vote, evaluator, timestamp`.
-   Every vote must be tagged with the strategy it belongs to — this is
-   the single piece of data the entire evaluation depends on.
+2. **Feedback storage: local CSV → Supabase.** The first working version
+   logged votes to a CSV file. That was flagged honestly to the mentor
+   before it became a problem: Streamlit Community Cloud's filesystem is
+   ephemeral, so a CSV would silently lose every vote on redeploy/restart.
+   Migrated to Supabase (hosted Postgres) instead — same public API in
+   `utils/feedback.py`, so `app.py` didn't need to change for the swap.
 
-4. **Streamlit UI changes.**
-   - `st.columns(n)` for side-by-side strategy display
-   - 👍/👎 controls under every recommended song, writing to the feedback table
-   - a separate tab computing and displaying relevance-rate per strategy
-     (a pandas groupby on the feedback table)
+3. **Bug found after deploying the Supabase migration:** every vote was
+   being logged with the same evaluator value, `evaluator_01`. Root cause
+   was a sidebar text input with that string hardcoded as its default,
+   which nobody was ever changing. Fixed by generating a random per-session
+   ID (`uuid`) automatically when the app first loads, so each browser
+   session gets a distinct evaluator tag with no manual step.
 
-5. **Fixed test-query set.** `data/test_queries.csv` — the same 5–10 seed
-   songs reused across every evaluator, so comparisons are apples-to-apples
-   rather than each evaluator testing arbitrary songs.
-
----
-
-## 5. Implementation Plan
-
-| Phase | Scope | Output |
-|---|---|---|
-| Phase 1 — Refactor | Split retrieval into strategy modules; standardize output schema | Three interchangeable strategy functions, unit-testable independently |
-| Phase 2 — Comparison UI | Side-by-side columns, feedback controls, fixed test-query set | Working prototype in Streamlit |
-| Phase 3 — Evaluator testing | Run the fixed test-query set past 2–3 evaluators, collect real votes | Populated feedback table, logged in `04_user_feedback.md` |
-| Phase 4 — Analysis & recommendation | Aggregate relevance-rate per strategy; write up findings | Final recommendation in `05_final_report.md` |
-
-Each phase produces a concrete artifact rather than moving straight to
-"finished feature" — this is what makes the process reviewable at every
-stage rather than only at the end.
+4. **Learned re-ranker (`utils/reranker.py`).** The original feedback
+   boost used a hand-guessed weight (`feedback_weight=0.05`) applied to a
+   song's raw historical relevance rate. This was replaced with a proper
+   model path: once there are 50+ labeled votes with both 👍 and 👎
+   present, a logistic regression trains on `(audio features →
+   relevant/not_relevant)` from real Supabase feedback, and its predicted
+   probability becomes the boost — learned weights instead of a guess.
+   Below that threshold (true as of this writing), the original heuristic
+   is used as a safe fallback, and the UI shows which mode is active.
 
 ---
 
-## 6. Loop Back — How Feedback Re-enters the Cycle
+## 5. Loop Back — How Feedback Re-enters the Cycle
 
-The aggregate relevance report from Phase 4 doesn't end the process — it
-feeds the next decision:
-
-- If one strategy clearly outperforms the others → that becomes the
-  recommendation for the real-catalog build, documented in
-  `05_final_report.md`.
-- If results are close or inconclusive → a new candidate strategy (e.g.
-  hybrid ranking) is added, and the comparison cycle repeats with the
-  updated set.
-- Either outcome is logged, so the next person picking up this project can see not just what was built,
-  but what was tried, what the evidence said, and why the current
-  direction was chosen.
-
-This is the mechanism that turns MUSICALLY from a one-shot demo into a
-system with an actual, demonstrable collaboration and iteration process —
-which was the original ask.
+- Once enough votes exist across all 5 strategies → the aggregate
+  relevance-rate table becomes the actual recommendation for what to
+  build at real scale, written into `05_final_report.md`.
+- Once 50+ labeled votes exist → the learned re-ranker activates
+  automatically, and its learned feature weights become a finding in
+  their own right (which audio traits evaluators actually respond to).
+- If results are close/inconclusive → a new candidate strategy is added
+  and the comparison repeats.
+- Every decision — including the ones that turned out to be wrong first
+  (CSV storage, the evaluator-ID bug) — is logged, not hidden, so the
+  next person picking this up sees the real path, not just the endpoint.
 
 ---
 

@@ -6,269 +6,208 @@
 
 ### Feature evaluated
 
-**Recommendation Strategy Evaluation**
+**Recommendation Strategy Evaluation + Learned Feedback Re-ranking**
 
 ## 2. Executive Summary
 
-MUSICALLY was originally built as a content-based music recommendation system using audio features.
+MUSICALLY was originally a content-based music recommender returning a
+single ranked list per query. It has been extended into (a) a
+5-strategy comparison tool, and (b) a feedback pipeline that both reports
+on strategy performance and, once there's enough data, actively improves
+future rankings.
 
-The new feature extends it into a controlled environment for comparing multiple retrieval strategies against the same test queries.
+The dataset is the public Kaggle "114k Spotify Tracks" dataset — real
+audio-feature values for real, named tracks (~81k unique after
+de-duplication, 114 genres), not synthetic data. It's a bounded subset of
+Spotify's catalog, not the full thing.
 
-The initial comparison includes:
-
-- Cluster-restricted KMeans
-- Global cosine similarity
-- Genre-filtered retrieval
-
-The evaluation uses a controlled synthetic dataset of approximately 80k songs.
-
-The goal is not to claim production-level recommendation quality. The goal is to generate directional evidence about how different retrieval approaches behave before investing in a real catalog implementation.
-
-> **Evaluation status:** Problem definition, PRD, and solutioning are complete. Final findings will be added after the comparison prototype is tested by evaluators and real feedback is collected.
+> **Status as of this report:** all 5 strategies are implemented and live
+> in the deployed app. Feedback collection is live and Supabase-backed.
+> Real vote count is still small and concentrated on one strategy/query —
+> not yet enough for a meaningful cross-strategy comparison or for the
+> learned re-ranker to activate. This report states that plainly rather
+> than filling in numbers that don't exist yet.
 
 ## 3. Original System
 
 **User selects song**
-→ **Audio features**
-→ **StandardScaler**
-→ **KMeans**
-→ **Cosine similarity**
+→ **Audio features + StandardScaler**
+→ **Cosine similarity (full dataset; KMeans for exploratory analysis only)**
 → **Ranked recommendations**
 → **Streamlit UI**
 
-The original system returned a single recommendation list.
+Limitation identified: no structured way to compare this approach against
+alternatives, and no mechanism to record evaluator judgment at all.
 
-The limitation identified was that there was no structured way to compare this retrieval strategy with alternatives or record evaluator judgments.
+## 4. Current System
 
-## 4. Problem Identified
+**User selects a song and a strategy**
+→ **`build_pool()` selects the candidate pool for that strategy**
+→ **Cosine similarity within that pool**
+→ **Score = similarity + popularity + feedback boost**
+→ **Top-N shown, with 👍/👎 per result**
+→ **Vote logged to Supabase, tagged with strategy + session evaluator ID**
+→ **Aggregate relevance-rate view (live)**
+→ **Learned re-ranker (activates automatically past a data threshold)**
 
-There are multiple reasonable retrieval approaches:
+## 5. Strategies Under Evaluation
 
-- Restrict search to the song's KMeans cluster.
-- Search the complete dataset using cosine similarity.
-- Apply genre constraints.
-- Later investigate hybrid ranking.
-
-The original system did not provide a controlled way to compare these alternatives.
-
-## 5. New Use Case
-
-MUSICALLY is being extended into a **retrieval-strategy evaluation tool**.
-
-For the same seed song:
-
-**One query**
-→ **KMeans strategy**
-→ **Global cosine strategy**
-→ **Genre-filtered strategy**
-→ **Side-by-side results**
-→ **Evaluator feedback**
-→ **Aggregate comparison**
-
-The retrieval layer becomes modular so additional strategies can be added without redesigning the whole application.
-
-## 6. Strategies Under Evaluation
-
-| Strategy | Description | Status |
+| Strategy | Candidate pool | Status |
 |---|---|---|
-| Cluster-restricted KMeans | Retrieves candidates from the seed song's KMeans cluster | Baseline |
-| Global cosine | Searches the full dataset using cosine similarity | Candidate |
-| Genre-filtered | Applies genre filtering with similarity retrieval | In progress |
-| Hybrid ranking | Combines multiple signals | Future candidate |
+| `global_cosine` | Full dataset | Implemented |
+| `genre_filtered` | Same `track_genre` as the query song | Implemented |
+| `kmeans_restricted` | Same KMeans `cluster` as the query song | Implemented |
+| `popularity_weighted` | Full dataset, popularity weighted much higher in scoring | Implemented |
+| `hybrid` | Same genre **and** same cluster | Implemented |
 
-Global cosine is treated as a candidate for comparison, not a final production decision.
+All 5 are live in the deployed app now — none are "future candidates."
 
-## 7. Evaluation Method
+## 6. Evaluation Method
 
-### Fixed test queries
+**Strategy selection:** an evaluator explicitly picks one of the 5
+strategies per search from a sidebar dropdown; every vote is tagged with
+whichever strategy was active when it was cast.
 
-Use a fixed set of approximately 5–10 seed songs.
+**Evaluator process:**
+1. Pick a strategy and a seed song.
+2. View the top-N recommendations for that strategy.
+3. Mark each as relevant 👍 or not relevant 👎.
+4. The app records the vote automatically (query, strategy, song, vote,
+   session evaluator ID, timestamp) to Supabase.
+5. Aggregate relevance rates recompute live from stored feedback.
 
-The same queries are reused across evaluators so strategies receive the same inputs.
+**Fixed test queries:** not yet formally enforced — evaluators have so far
+searched arbitrary songs. Recommended next step: agree on 5–10 fixed seed
+songs so results across evaluators and strategies are apples-to-apples
+(see §15).
 
-### Evaluator process
+## 7. Automatic Feedback Collection
 
-1. Run all configured strategies.
-2. Display top-N recommendations side by side.
-3. Evaluator marks each recommendation as:
-   - Relevant 👍
-   - Not relevant 👎
-4. The application automatically records the feedback.
-5. Aggregate relevance rates are calculated from stored feedback.
-
-## 8. Automatic Feedback Collection
-
-When an evaluator clicks 👍 or 👎, the Streamlit application creates a record containing:
-
+Schema (Supabase `feedback` table):
 ```text
-query_song
-strategy
-recommended_song
-vote
-evaluator
-timestamp
+query_song, strategy, recommended_song, vote, evaluator, created_at
 ```
+The evaluator never enters these fields manually — `log_feedback()` in
+`utils/feedback.py` writes them on every 👍/👎 click. See
+`04_user_feedback.md` for the full schema notes and the evaluator-ID
+bug/fix history.
 
-Example:
+## 8. Evaluation Metric
 
-```text
-Believer
-global_cosine
-Song A
-relevant
-evaluator_01
-2026-09-16 14:30:21
-```
+**Relevance Rate = relevant recommendations / total evaluated**, computed
+per strategy via `relevance_rate()` — a live query against Supabase, not
+a static number. This is an evaluator-feedback metric, not model accuracy.
 
-The evaluator does not manually enter these fields.
+## 9. Results
 
-Initial storage:
+### Current status: pending a proper evaluator round
 
-```text
-data/feedback.csv
-```
-
-or, if SQLite is selected:
-
-```text
-feedback.db
-```
-
-The aggregate view reads this stored data.
-
-## 9. Evaluation Metric
-
-**Relevance Rate**
-
-```text
-Relevance Rate =
-Number of relevant recommendations
-------------------------------------
-Total recommendations evaluated
-```
-
-It can be calculated per strategy and across the fixed test-query set.
-
-This is an evaluator-feedback metric, **not model accuracy**.
-
-## 10. Results
-
-### Current status
-
-**Pending first evaluator round.**
-
-No final strategy conclusion should be written until actual feedback has been collected.
+Real votes exist but are concentrated on a single strategy/query so far —
+not yet a valid basis for a cross-strategy conclusion. No strategy
+ranking should be claimed until votes are spread across all 5 strategies
+and multiple queries.
 
 ### Overall results
 
 | Strategy | Relevant | Evaluated | Relevance Rate |
 |---|---:|---:|---:|
-| Cluster-restricted KMeans | — | — | — |
-| Global cosine | — | — | — |
-| Genre-filtered | — | — | — |
+| `global_cosine` | — | — | — |
+| `genre_filtered` | — | — | — |
+| `kmeans_restricted` | — | — | — |
+| `popularity_weighted` | — | — | — |
+| `hybrid` | — | — | — |
 
-### Per-query analysis
+*(Populate from `relevance_rate()`'s live output once evaluator testing
+covers all 5 strategies — see §15 for the concrete next step.)*
 
-| Query | KMeans | Global Cosine | Genre-filtered | Observations |
-|---|---:|---:|---:|---|
-| | | | | |
-| | | | | |
-| | | | | |
+## 10. Learned Re-ranker — Methodology and Status
 
-Only actual evaluation results should be entered.
+The original feedback boost applied a hand-picked weight
+(`feedback_weight=0.05`) to a song's historical relevance rate, with no
+data behind the number. `utils/reranker.py` replaces this with a proper
+model, gated behind a real-data threshold so it can't be presented as
+"learned" when it's actually just overfit to a handful of examples:
+
+- **Below 50 labeled votes, or if all votes so far are one-sided** (all
+  👍 or all 👎): the original heuristic remains active. This is the
+  current state.
+- **At 50+ labeled votes with both classes present:** a logistic
+  regression trains on `(audio features → relevant/not_relevant)` from
+  real Supabase feedback, and its predicted probability becomes the
+  boost — weights the data actually justifies, not a guess.
+- The app shows, live, which mode is active (`🧠 Learned re-ranker
+  active` vs `📊 Using heuristic feedback boost — N/50 votes`), so this
+  is always verifiable rather than asserted.
+- Once the threshold is crossed, this section should be updated with
+  which audio features the model weighted most heavily (from the trained
+  model's coefficients) — a genuine finding, not available yet.
 
 ## 11. Qualitative Findings
 
-After testing, record:
-
-### What worked
-
-- Recommendations consistently considered relevant.
-- Useful strategy behaviour.
-- Meaningful differences between strategies.
-
-### What did not work
-
-- Clearly irrelevant recommendations.
-- Cases where a strategy excluded useful songs.
-- Problems introduced by genre filtering.
-- Noisy or ambiguous outputs.
-
-### Unexpected findings
-
-Record observations that differed from the initial expectation.
-
-Findings should reflect the actual evaluator feedback.
+Not yet populated — genuinely pending a real evaluator round across all 5
+strategies. Will record, once available: which recommendations evaluators
+consistently agreed were relevant, which strategy produced surprising or
+clearly wrong results, and whether genre/cluster restriction visibly
+traded relevance for narrowness.
 
 ## 12. Limitations
 
-1. **Synthetic dataset:** It is not a live production music catalog.
-2. **Human judgments:** Evaluators may disagree about relevance.
-3. **No real user behaviour:** The evaluation does not measure clicks, skips, saves, listening duration, or repeat plays.
-4. **Directional evidence:** Results inform what to investigate next but are not a production benchmark.
-5. **Limited strategy set:** Only implemented and tested strategies can be compared.
+1. **Bounded dataset:** ~81k real tracks across 114 genres — real audio
+   features, but not the full Spotify catalog, and not licensed for
+   production use.
+2. **Human judgment:** evaluators may disagree about relevance, and
+   `evaluator` currently identifies a browser session, not a verified
+   person (see `04_user_feedback.md` §9).
+3. **No real user behavior:** votes are explicit judgments, not clicks,
+   skips, saves, or repeat plays.
+4. **Directional evidence:** informs what to investigate next, not a
+   production benchmark.
+5. **Small current sample:** not yet enough spread across strategies/
+   queries for the results in §9 to mean anything — stated plainly rather
+   than papered over.
 
 ## 13. Decision
 
-This section will be completed after the first evaluation round.
-
-The decision should consider:
-
-- aggregate relevance rate,
-- consistency across fixed queries,
-- qualitative evaluator feedback,
-- synthetic-data limitations,
-- implementation complexity,
-- requirements of the eventual real catalog.
-
-Possible next actions:
-
-- continue investigating a candidate strategy,
-- modify an existing strategy,
-- introduce a hybrid strategy,
-- add another candidate and repeat the comparison.
-
-The report should document the evidence and reasoning behind the selected next step.
+Not yet reached — genuinely pending real evaluator data across all 5
+strategies (§9) and, separately, the learned re-ranker crossing its
+50-vote threshold (§10). Once both exist, this section should weigh:
+aggregate relevance rate, consistency across fixed queries, qualitative
+evaluator feedback, dataset-scope limitations, and what the learned
+re-ranker's feature weights revealed.
 
 ## 14. Feedback Loop
 
-**Problem**
-→ **Requirements**
-→ **PRD**
-→ **Solutioning**
-→ **Implementation**
-→ **Evaluator Testing**
-→ **Feedback**
-→ **Analysis**
-→ **Decision**
-→ **Next PRD / iteration**
+**Problem → Requirements → PRD → Solutioning → Implementation → Evaluator
+Testing → Feedback → Analysis → Decision → Next iteration**
 
-The purpose is to turn the project from a one-time recommendation demo into an iterative evaluation process.
+This closes at "Decision" only once real, spread-out feedback exists —
+not before.
 
 ## 15. Next Steps
 
 ### Immediate
+1. Get more real evaluators voting, explicitly across all 5 strategies
+   (not just `global_cosine`) and a shared set of query songs.
+2. Formalize a fixed 5–10 seed-song test set so results are comparable.
+3. Once votes are spread out: populate §9's results table for real.
 
-1. Implement/refactor the strategy modules.
-2. Add the side-by-side comparison UI.
-3. Add automatic 👍/👎 feedback logging.
-4. Create the fixed test-query set.
-5. Run the first evaluator round.
+### Once 50+ labeled votes exist
+4. Confirm the learned re-ranker activated (check the UI status caption).
+5. Record which audio features it weighted most heavily.
+6. Compare recommendations before/after the re-ranker activated.
 
-### After testing
-
-6. Calculate relevance rate per strategy.
-7. Review qualitative feedback.
-8. Discuss findings with the team.
-9. Update solutioning based on evidence.
-10. Document the next iteration.
+### After that
+7. Discuss findings with the team.
+8. Decide: keep the current strategy set, tune one, or add a new
+   candidate and repeat the comparison.
+9. Document the next iteration.
 
 ## 16. Final Takeaway
 
-MUSICALLY is being developed as a controlled environment for testing recommendation retrieval strategies before applying a chosen approach to a real catalog.
-
-The value of the feature is the ability to:
-
-**compare → collect feedback → measure → discuss → iterate**
-
-using the same queries and a traceable feedback record.
+MUSICALLY is a working, live environment for comparing 5 retrieval
+strategies using real evaluator feedback, with a feedback pipeline that
+does two real jobs: reporting (the aggregate relevance table) and
+learning (the re-ranker, once enough data exists). The honest current
+state is: built and deployed, evaluator testing still early — the next
+concrete milestone is simply getting more real votes spread across
+strategies and queries.
