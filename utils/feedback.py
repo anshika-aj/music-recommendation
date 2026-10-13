@@ -50,8 +50,11 @@ def log_feedback(query_song: str, strategy: str, recommended_song: str, vote: st
         }).execute()
         return True
     except Exception as e:
-        # Database unreachable (e.g. Supabase project paused) -- don't crash the app.
-        st.warning("Feedback database is unreachable right now, so this vote was not saved.")
+        # Don't crash the app, but show the real reason (no secrets are printed).
+        st.warning(
+            "Vote not saved. Reason: "
+            f"{type(e).__name__}: {str(e)[:300]}"
+        )
         return False
 
 
@@ -63,8 +66,9 @@ def load_feedback() -> pd.DataFrame:
     ])
     try:
         response = _client().table("feedback").select("*").execute()
-    except Exception:
-        # Database unreachable -- recommendations still work, just without feedback data.
+    except Exception as e:
+        # Recommendations still work, just without feedback data.
+        st.session_state["_fb_error"] = f"{type(e).__name__}: {str(e)[:300]}"
         return empty
     if not response.data:
         return empty
