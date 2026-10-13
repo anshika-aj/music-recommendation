@@ -40,23 +40,34 @@ def log_feedback(query_song: str, strategy: str, recommended_song: str, vote: st
     Insert one feedback record. vote must be "relevant" or "not_relevant"
     (matches docs/04_user_feedback.md and the table's CHECK constraint).
     """
-    _client().table("feedback").insert({
-        "query_song": query_song,
-        "strategy": strategy,
-        "recommended_song": recommended_song,
-        "vote": vote,
-        "evaluator": evaluator,
-    }).execute()
+    try:
+        _client().table("feedback").insert({
+            "query_song": query_song,
+            "strategy": strategy,
+            "recommended_song": recommended_song,
+            "vote": vote,
+            "evaluator": evaluator,
+        }).execute()
+        return True
+    except Exception as e:
+        # Database unreachable (e.g. Supabase project paused) -- don't crash the app.
+        st.warning("Feedback database is unreachable right now, so this vote was not saved.")
+        return False
 
 
 def load_feedback() -> pd.DataFrame:
     """Return all logged feedback as a DataFrame."""
-    response = _client().table("feedback").select("*").execute()
+    empty = pd.DataFrame(columns=[
+        "id", "query_song", "strategy", "recommended_song",
+        "vote", "evaluator", "created_at",
+    ])
+    try:
+        response = _client().table("feedback").select("*").execute()
+    except Exception:
+        # Database unreachable -- recommendations still work, just without feedback data.
+        return empty
     if not response.data:
-        return pd.DataFrame(columns=[
-            "id", "query_song", "strategy", "recommended_song",
-            "vote", "evaluator", "created_at",
-        ])
+        return empty
     return pd.DataFrame(response.data)
 
 
