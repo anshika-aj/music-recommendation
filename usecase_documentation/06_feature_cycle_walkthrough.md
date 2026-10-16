@@ -2,7 +2,7 @@
 
 This doc walks through the full, real cycle for this project — not just
 the final code, but the order things actually happened in, including the
-points where testing caught something wrong and it had to be fixed.
+points where testing or review caught something wrong and it had to be fixed.
 
 ```mermaid
 flowchart LR
@@ -19,8 +19,8 @@ flowchart LR
 ```
 
 *(`PRD` and `Solutioning` were revisited more than once as real issues
-came up mid-implementation — the loop above isn't strictly one-pass, and
-§3–§5 below show where that happened.)*
+came up mid-implementation and after the mentor review — the loop above isn't
+strictly one-pass, and §3–§5 below show where that happened.)*
 
 ---
 
@@ -78,48 +78,100 @@ unnecessary duplication, and that's recorded rather than quietly ignored.
 4. **Caught a storage bug before it caused data loss:** Streamlit
    Community Cloud's filesystem is ephemeral — a CSV would be silently
    wiped on every restart/redeploy. Migrated feedback storage to Supabase
-   (hosted Postgres) instead, keeping `utils/feedback.py`'s public
-   functions unchanged so `app.py` didn't need to change its calling
-   code.
+   (hosted Postgres), keeping `utils/feedback.py`'s public functions
+   unchanged. Deployment then needed debugging (a missing package and
+   missing secrets on Streamlit Cloud), and later a paused free Supabase
+   project had to be restored.
 5. **Caught a real bug after deploying the migration:** checked the live
-   Supabase table directly and found every single row logged with the
-   identical evaluator value, `evaluator_01`. Traced it to a hardcoded
-   default on a sidebar text input that nothing was prompting people to
-   change. Fixed by auto-generating a random per-session ID instead —
-   removes the failure mode rather than just documenting around it.
+   Supabase table directly and found every row logged with the identical
+   evaluator value, `evaluator_01` — a hardcoded default on a sidebar text
+   input. Fixed by auto-generating a random per-session ID instead.
 6. **Asked the harder question: what's the point of collecting feedback
-   at all, beyond a display table?** This led to building
-   `utils/reranker.py` — a logistic regression trained on real feedback
-   that replaces the original hand-guessed `feedback_weight=0.05`, gated
-   behind a 50-labeled-vote threshold so it can't activate on too little
-   data and overfit to noise. Below the threshold, the original heuristic
-   stays active as a safe fallback, and the app shows which mode is
-   running.
+   at all, beyond a display table?** This led to `utils/reranker.py` — a
+   logistic regression trained on real feedback that replaces the original
+   hand-guessed `feedback_weight=0.05`, gated at 50 labelled votes.
+7. **First evaluation round:** 80 votes over 4 seed songs and all 5
+   strategies. Result: genre-based strategies `hybrid` (13/13) and
+   `genre_filtered` (18/19) were judged relevant far more often than
+   `popularity_weighted` (5/16), `global_cosine` (4/17) and
+   `kmeans_restricted` (1/15). Treated as early signal, not a verdict.
+8. **Mentor review of the live app — four problems:**
+   - **Duplicates.** The search list repeated songs and a song could be
+     recommended back to itself. Cause: the dataset keeps one song per
+     release under different track IDs, and cleaning only removed repeated
+     IDs. Fixed with one row per (track, artist) plus ranking-time rules.
+   - **Feedback buttons did nothing visible.** ~13 👍 on one song changed
+     nothing. Causes: weight far smaller than the score spread; the learned
+     model ignored which query a song was recommended for; repeated votes
+     counted as many. Fixed with a query-specific memory, collapsing repeated
+     votes, and keeping the model as a small extra.
+   - **Match score unclear.** It was the blended ranking score labelled like a
+     similarity. Now "N% sound match" (pure similarity), popularity labelled
+     separately, formula shown.
+   - **Documents out of date.** Rewritten to match the code and the data.
+9. **Methodology safeguard that came out of #8:** because feedback now changes
+   rankings, a "Use feedback re-ranking" toggle was added and votes cast with it
+   ON are stored as `<strategy>+feedback`, so clean strategy numbers stay clean.
 
 ## 5. Where I changed my mind, and where a suggestion turned out wrong
 
-> This section is intentionally left for direct, first-person reflection
-> rather than written up generically — it's meant to capture a real
-> moment where an AI-assisted suggestion led somewhere that had to be
-> caught and corrected, in my own words, not a templated example.
->
-> Candidates worth thinking about honestly: the `strategies/` package →
-> single-dispatcher change in §3, the CSV → Supabase migration, or the
-> evaluator-ID bug itself — was any of these a case where I initially
-> accepted a suggestion without fully checking it, and only caught the
-> problem by actually testing the deployed app? What did that teach me
-> about verifying AI-assisted work rather than trusting it by default?
+**1. I treated categorical features as numbers (the earliest mistake).**
+My first model fed 13 audio features into the scaler, including `key`
+(a pitch class from 0 to 11), `mode` (major or minor) and `time_signature`.
+I accepted them because they are stored as numbers. But a key of 11 is not
+"more" than a key of 1, and mode is a yes/no. Scaled and fed into cosine
+similarity, these three columns carried as much weight as danceability or
+energy. The symptom was recommendations that matched on key and time signature
+instead of sound — 95%+ similarity between completely different genres.I dropped the three columns, re-ran the
+elbow/silhouette analysis, and the best cluster count moved from 10 to 8.
+*Lesson: a column being a number does not mean it behaves like one, and a
+surprisingly high similarity is a reason to be suspicious, not pleased.*
+
+**2. I trusted the KMeans cluster as a gate.**
+The recommender only searched inside a song's cluster. With 8 clusters over 113
+genres, a cluster was a rough audio neighbourhood, not a genre. Restricting a
+query to its own genre fixed the results immediately, which told me the real
+problem was the hard boundary, not "accuracy". My own votes later agreed:
+`kmeans_restricted` had the lowest relevance rate (1 of 15).
+
+**3. I assumed things worked without checking the live system.**
+The first feedback store was a CSV; on Streamlit Cloud it would silently lose
+every vote on redeploy, so I moved to Supabase before any data was lost. After
+deploying, every row said `evaluator_01` — I only saw it by opening the
+Supabase table, and the cause was a hardcoded default in the sidebar. I also
+dropped the planned `strategies/` package for one `build_pool()` function once I
+saw five files would mostly duplicate each other.
+
+**4. Two mistakes in the review round.**
+- *Wrong diagnosis.* When the strategies looked identical I blamed the small
+  dataset and started asking about bigger ones. Running the strategies on the
+  real data showed they were different; the deployed app was still running the
+  old code. Checking first saved me from fixing the wrong thing.
+- *"Active" is not "working".* I built the learned re-ranker, saw "active,
+  trained on 110 votes", and treated it as done. I had checked that it ran, not
+  that a 👍 visibly changed anything. When my mentor voted 👍 about 13 times on
+  one song and nothing moved, it exposed three flaws: the weight was tiny, the
+  model never saw which query a song belonged to, and repeated votes counted as
+  many. The re-ranker design I accepted from AI assistance had that blind spot
+  from the start, and I had not tested the behaviour a user would expect.
+  The same pattern showed in the docs: they said ~81k songs while the app
+  showed 89,740 duplicates-included, because I wrote them from the plan, not
+  from the running app.
+
+**What I do differently now.** I check what the user would actually see, not
+only that the code runs. I read the live data (the Supabase table, the search
+list, the counts) before trusting a number. I treat a result that is
+suspiciously good, or suspiciously identical, as a prompt to investigate. And I
+write documentation from the running system.
 
 ## 6. Where this loops back
 
-Once real feedback exists spread across all 5 strategies:
-- the aggregate relevance table (`04_user_feedback.md` §8,
-  `05_final_report.md` §9) becomes real evidence for what to build at
-  scale, and
-- crossing 50 labeled votes activates the learned re-ranker
-  automatically, turning the feedback loop from "we display what
-  happened" into "the system gets better because of what happened."
+- The aggregate relevance table (`04_user_feedback.md` §8,
+  `05_final_report.md` §9) is the first real evidence for what to build at
+  scale; it needs more evaluators and a fixed seed list to become a result.
+- Comparing `<strategy>` with `<strategy>+feedback` rows will show whether
+  the feedback loop actually raises relevance.
+- Next build candidate: a query-aware learned re-ranker.
 
 Either way, the result gets logged in `05_final_report.md`, and the next
-iteration (tune a strategy, add a new one, or move toward a real catalog)
-starts from that evidence — not from scratch.
+iteration starts from that evidence — not from scratch.

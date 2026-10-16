@@ -8,10 +8,9 @@ Evaluators are team members/product or engineering stakeholders judging retrieva
 
 Feedback is collected through the live Streamlit app and stored automatically in Supabase whenever an evaluator clicks 👍 or 👎.
 
-> **Status:** live and collecting real feedback (not simulated). Vote
-> counts are still low — see §5 for the current snapshot. Sections below
-> marked "populate as data grows" are genuinely incomplete, not filled
-> with placeholder numbers.
+> **Status:** live and collecting real feedback (not simulated). A first
+> evaluation round across all 5 strategies exists (§5, §8); evaluator count
+> and query variety are still low, so results are early signal, not a verdict.
 
 ## 2. Feedback fields
 
@@ -19,8 +18,8 @@ For every recommendation, the system records:
 
 | Field | Meaning |
 |---|---|
-| `query_song` | Seed song selected by the evaluator |
-| `strategy` | Which of the 5 strategies generated this recommendation |
+| `query_song` | Seed song selected by the evaluator ("Track — Artist") |
+| `strategy` | Which strategy generated this recommendation. Ends in `+feedback` if feedback re-ranking was switched on when the vote was cast (e.g. `hybrid+feedback`) |
 | `recommended_song` | Song being evaluated ("Track — Artist") |
 | `vote` | `relevant` or `not_relevant` |
 | `evaluator` | Auto-generated per-browser-session ID (see §3) |
@@ -30,49 +29,63 @@ The evaluator does **not** manually fill this table — every row above is writt
 
 ## 3. How a vote becomes a record
 
-**Evaluator picks a strategy from the sidebar**
+**Evaluator picks a strategy from the sidebar** (and leaves feedback re-ranking on or off)
 → **Evaluator selects a seed song and searches**
 → **Recommendations appear, tagged with the active strategy**
 → **Evaluator clicks 👍 / 👎 on a result**
 → **`log_feedback()` inserts one row into the Supabase `feedback` table**
 → **Aggregate relevance rate (§8) is recalculated on next view**
 
+**Repeated votes.** Raw rows are never deleted. When feedback is *used* (in
+the aggregate table, the query-specific memory and the learned model), all rows
+with the same `(query_song, strategy, recommended_song)` are collapsed into one
+judgement by majority vote (a tie counts as `not_relevant`). Clicking the same
+button many times therefore counts once. This was added after ~14 repeated 👍
+on a single song during a live review inflated that strategy's numbers and
+made the model overconfident.
+
 **On the `evaluator` field specifically:** earlier in this project, every
 row was logged with the same hardcoded value (`evaluator_01`) because of
-a bug in a sidebar input — this was caught by checking the live Supabase
-table directly and seeing every row identical. It's now fixed: on first
-load, the app generates a random ID (`evaluator_<8 hex chars>`) and stores
-it in the browser session, so distinct sessions produce distinct IDs
-automatically. This is **session-level**, not person-level — the same
-person voting from two different tabs/devices will show up as two
-evaluators. See §9 for why this is an accepted limitation for now.
+a bug in a sidebar input — caught by checking the live Supabase table
+directly. It's now fixed: on first load the app generates a random ID
+(`evaluator_<8 hex chars>`) and stores it in the browser session. This is
+**session-level**, not person-level — the same person voting from two
+different tabs/devices appears as two evaluators. See §9.
 
 ## 4. Feedback storage
 
-**Supabase** (hosted Postgres) — not a local CSV. This matters because
-Streamlit Community Cloud's filesystem is ephemeral: a CSV file would be
-silently wiped on every app restart or redeploy. Supabase persists
-independently of the app's own lifecycle.
+**Supabase** (hosted Postgres) — not a local CSV. Streamlit Community Cloud's
+filesystem is ephemeral: a CSV would be silently wiped on every restart or
+redeploy. Supabase persists independently of the app's lifecycle.
 
 Table: `feedback`, columns as in §2, with Row-Level Security policies
 controlling read/write access. Accessed from `utils/feedback.py` via the
-`supabase-py` client.
+`supabase-py` client. Free Supabase projects are paused after a period of
+inactivity; if the app cannot reach the database, restore the project from the
+Supabase dashboard.
 
 ## 5. Current snapshot
 
-As of the last check, the table held a small number of real votes — all
-logged under the `global_cosine` strategy, all against one query song
-("Ab — The Local Train"), roughly evenly split between `relevant` and
-`not_relevant`. This is an early sanity-check sample confirming the
-pipeline works end-to-end — **not** a representative comparison yet. The
-tables in §7 and §8 stay unpopulated until there's enough spread across
-strategies and query songs to say something real.
+**First evaluation round — 80 votes.** One evaluator (the project author)
+voted on **4 seed songs × all 5 strategies** (for example "Desi Kalakaar — Yo Yo
+Honey Singh" and "Ab — The Local Train"), giving 80 rows. Per-strategy numbers
+are in §8.
+
+**Later votes — 110 rows in total at the time of the mentor review.** The
+extra rows came from further test rounds (e.g. "Blank Space — Taylor Swift")
+and from the mentor's live review, where the same song ("Faded — Alan Walker"
+for the seed "Blinding Lights — The Weeknd") was voted 👍 about 14 times across
+sessions. Those repeats are what exposed the problems fixed in the review
+round, and why repeated votes now count once.
+
+Not yet available: a shared fixed seed-song list, more than two people voting,
+or votes cast with feedback re-ranking OFF vs ON in comparable numbers.
 
 ## 6. Questions for evaluators
 
 ### Understanding what "relevant" means
 
-1. What makes a recommendation relevant — same genre, sound/mood, era, or something else?
+1. What makes a recommendation relevant — same genre, sound/mood, era, language, or something else?
 2. Should the comparison prioritize relevance, diversity, novelty, or a combination?
 3. What kind of recommendation would make you reject a strategy?
 
@@ -90,9 +103,9 @@ strategies and query songs to say something real.
 
 | Date | Question | Response | Impact |
 |---|---|---|---|
-| | | | |
-
-Record only actual questions, responses, and resulting decisions — populate as they happen.
+| Oct 2026 | What do the match score and popularity on a card mean? | Match was a blended ranking score labelled like a similarity; popularity is Spotify's 0–100 score | Card now shows "sound match" = pure similarity; scores explained in the app |
+| Oct 2026 | Why did ~13 👍 votes on one song change nothing? | Weight too small; model ignored the query; repeated votes counted as many | Query-specific memory added; repeated votes collapsed; see `03_solution.md` |
+| Oct 2026 | Why do results contain several copies of the same song? | Dataset repeats songs under different track IDs; cleaning only removed repeated IDs | One row per (track, artist); query copies/covers excluded |
 
 ## 8. Aggregate evaluation
 
@@ -100,37 +113,46 @@ The app calculates, live, from Supabase:
 
 **Relevance Rate = Relevant recommendations / Total evaluated recommendations**
 
+First-round result (80 votes, 4 seed songs, one evaluator, counted **before**
+repeated votes were collapsed — in this round each recommendation was voted once):
+
 | Strategy | Relevant | Evaluated | Relevance rate |
 |---|---:|---:|---:|
-| `global_cosine` | — | — | — |
-| `genre_filtered` | — | — | — |
-| `kmeans_restricted` | — | — | — |
-| `popularity_weighted` | — | — | — |
-| `hybrid` | — | — | — |
+| `hybrid` | 13 | 13 | 100.0% |
+| `genre_filtered` | 18 | 19 | 94.7% |
+| `popularity_weighted` | 5 | 16 | 31.3% |
+| `global_cosine` | 4 | 17 | 23.5% |
+| `kmeans_restricted` | 1 | 15 | 6.7% |
 
-To be filled from real stored feedback once there's a meaningful spread
-across all 5 strategies and multiple query songs — not from the early
-sanity-check sample in §5.
+Evaluated counts differ (13–19) because not every result was voted on.
+Rows added after this round are not included; the in-app table now counts
+unique judgements and also lists `<strategy>+feedback` rows separately.
 
 ## 9. Limitations
 
 - Results are directional, not a production benchmark.
-- Relevance judgments are subjective and evaluator-dependent.
-- `evaluator` identifies a browser session, not a person — the same
-  person voting from multiple sessions appears as multiple evaluators.
-  Acceptable at current scale; would need a real login/identity step to
-  fix properly if evaluator count grows.
-- The dataset is a real but bounded subset of Spotify's catalog (~81k
-  tracks, 114 genres) — not the full catalog, and not production
-  engagement data (clicks, skips, saves, repeat plays).
+- Relevance judgments are subjective and evaluator-dependent. In the first
+  round the evaluator's idea of "relevant" appears to track genre, language
+  and artist — which structurally favours the two genre-based strategies.
+- Only 4 seed songs and, in the first round, one evaluator.
+- A rate of 13/13 on a small sample means "relevant every time so far", not
+  "100% accurate".
+- `evaluator` identifies a browser session, not a person.
+- The dataset is a real but bounded subset of Spotify's catalog (~81k unique
+  songs, 114 genres) — not the full catalog, and not production engagement
+  data (clicks, skips, saves, repeat plays).
 - A higher relevance rate here does not automatically mean the same
   strategy would perform better against a real, full-scale catalog.
+- Once feedback re-ranking is ON, later results are shaped by earlier votes;
+  those votes are tagged `+feedback` and must not be pooled with the plain
+  strategy numbers.
 
 ## 10. Feedback → next iteration
 
 **Feedback (Supabase)**
-→ **Aggregate relevance-rate per strategy** *(this doc, §8)*
-→ **Once 50+ labeled votes exist: learned re-ranker activates** *(`utils/reranker.py`, see `05_final_report.md`)*
+→ **Aggregate relevance-rate per strategy** *(§8)*
+→ **Query-specific memory re-ranks results for the same seed song immediately**
+→ **At 50+ unique labelled votes: learned re-ranker adds a general nudge** *(`utils/reranker.py`, see `05_final_report.md`)*
 → **Discuss findings with the team**
 → **Decide whether to keep, modify, or add a strategy**
 → **Update the PRD/solutioning docs**

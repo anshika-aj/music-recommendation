@@ -1,28 +1,101 @@
-# 🎵 MUSICALLY — Content-Based Music Recommendation System
+# 🎵 MUSICALLY — Content-Based Music Recommendation & Retrieval-Strategy Evaluation
 
-A Streamlit app that recommends songs based on **audio characteristics**
-(danceability, energy, acousticness, valence, tempo, etc.) rather than
-genre labels or listening history — matched with cosine similarity over
-~90,000 Spotify tracks, with genre-aware filtering, a popularity
-re-rank, and an artist-diversity cap layered on top.
+A Streamlit app that recommends songs from **audio characteristics**
+(danceability, energy, acousticness, valence, tempo, etc.) rather than genre
+labels or listening history, matched with cosine similarity over ~81,000 unique
+Spotify tracks.
+
+It started as a single-strategy recommender. It is now also a small
+**evaluation tool**: five retrieval strategies can be run on the same query,
+evaluators vote 👍/👎 on each result, the votes are stored in Supabase, and the
+votes are used both to *compare* the strategies and to *re-rank* future results.
 
 ---
 
 ## How It Works
 
-1. **Clean** the raw Spotify dataset (drop nulls/duplicates, ~89,740
-   tracks remain).
+1. **Clean** the raw Spotify dataset: drop nulls, drop repeated track IDs, then
+   keep **one row per (track name, artist)** — the most popular copy — because
+   the dump lists the same song several times (album / single / compilation
+   re-releases). ~81k unique songs remain.
 2. **Scale** 10 continuous audio features with `StandardScaler`.
-3. **Cluster** songs into 8 groups with `KMeans` (used for EDA/visualization
-   only — see below for why it's not used for retrieval anymore).
-4. **Recommend**: given a song, compute cosine similarity against the
-   candidate pool directly — the whole dataset, or just the song's own
-   genre by default — then re-rank slightly by popularity and cap how
-   many songs from one artist can appear in the results.
+3. **Cluster** songs into 8 groups with `KMeans` (used for EDA, and as the
+   candidate pool of the `kmeans_restricted` and `hybrid` strategies).
+4. **Retrieve**: the chosen *strategy* decides which songs are candidates
+   (whole catalogue, same genre, same cluster, ...), cosine similarity is
+   computed against that pool, and the results are ranked.
+5. **Collect feedback**: 👍/👎 per result goes to Supabase and feeds back into
+   ranking and into the per-strategy comparison.
 
 ```
-Raw dataset → clean → scale → cosine similarity (genre-aware, global) → re-rank → top-N
+query song → strategy picks candidate pool → cosine similarity → rank
+           → remove copies/covers of the query + cap songs per artist → top-N
+           → 👍/👎 → Supabase → comparison table + re-ranking
 ```
+
+---
+
+## Reading a result card
+
+| On the card | What it is |
+|---|---|
+| **% sound match** | Cosine similarity between the audio features of your song and this song, as a percentage. It is *pure audio closeness* and nothing else. |
+| **⭐ popularity** | Spotify's own 0–100 popularity score for the track (from the dataset, based on how much it is played). It is not computed by this app. |
+
+The **order** of the cards is not just the sound match. Each candidate is
+ranked by:
+
+```
+score = (1 − pop_w − fb_w) · similarity
+        + pop_w · popularity (scaled 0..1 inside the candidate pool)
+        + fb_w  · model/heuristic feedback score
+        + 0.10  · query-specific feedback score
+```
+
+Defaults: `pop_w = 0.10`, `fb_w = 0.05`. The `popularity_weighted` strategy
+raises `pop_w` to 0.45. Switching **Use feedback re-ranking** off removes the
+two feedback terms.
+
+> Earlier versions printed this blended score under the label "match", which
+> made it look like a similarity percentage. The card now shows the pure
+> similarity as "sound match" and the app explains the ranking under the title.
+
+---
+
+## The 5 retrieval strategies
+
+| Strategy | Candidate pool |
+|---|---|
+| `global_cosine` | The whole catalogue |
+| `genre_filtered` | Songs with the same `track_genre` as the query song |
+| `kmeans_restricted` | Songs in the same KMeans cluster as the query song |
+| `popularity_weighted` | The whole catalogue, but popularity weighs 0.45 instead of 0.10 |
+| `hybrid` | Songs matching **both** the genre and the cluster |
+
+Ranking is identical across strategies, so a comparison is about *which songs
+are considered*, not about five different formulas. A pool with fewer than 5
+songs falls back to the whole catalogue.
+
+---
+
+## How feedback is used
+
+1. **Strategy comparison.** The "Aggregate relevance" table shows, per strategy,
+   how many results were marked relevant.
+2. **Query-specific memory.** For the *same query song*, a result that earlier
+   evaluators marked 👍 moves up and one marked 👎 moves down
+   (`(2·relevant − n) / (n + 1)`, weight 0.10 — one vote counts less than
+   several agreeing votes). This is the part that visibly changes the list.
+3. **Learned re-ranker** (`utils/reranker.py`). With 50+ unique labelled votes
+   and both classes present, a logistic regression on the 10 audio features
+   adds a small nudge (weight 0.05). Below that, a simple per-song relevance
+   rate is used. It learns *audio taste in general*; it does not know which
+   query a song was recommended for — that is what item 2 covers.
+4. **Repeated votes count once.** Several votes on the same
+   (query, strategy, song) are collapsed to the majority vote, so clicking
+   the same button 14 times is one judgement, not 14.
+5. **Clean comparison.** Votes cast with feedback re-ranking ON are stored as
+   `<strategy>+feedback`, so they never mix with the plain strategy numbers.
 
 ---
 
@@ -48,31 +121,36 @@ optimal cluster count from **10 → 8**:
 ## Model Fix #2 — Retiring the KMeans Hard-Cluster Gate
 
 The original recommender found a song's KMeans cluster and only ever
-searched *inside* that cluster. With just 8 clusters covering 114k
-songs across 113 genres, a cluster turned out to be a rough audio
-neighbourhood, not a genre — so a song like *Believer* pulled
-recommendations from Bach, bluegrass, jazz, and tango, and an Indian
-track pulled Russian, Chinese, and Brazilian songs alongside sensible
-ones. Manually restricting a query to its own genre fixed this
-immediately, which pointed at the real problem: the hard cluster
+searched *inside* that cluster. With just 8 clusters covering the catalogue
+across 113 genres, a cluster turned out to be a rough audio neighbourhood,
+not a genre — so a song like *Believer* pulled recommendations from Bach,
+bluegrass, jazz, and tango, and an Indian track pulled Russian, Chinese, and
+Brazilian songs alongside sensible ones. Restricting a query to its own genre
+fixed this immediately, which pointed at the real problem: the hard cluster
 boundary, not a lack of "accuracy."
 
-The retrieval logic was changed to:
+KMeans therefore stopped being an always-on gate. It is now only one of five
+*strategies being compared*, and the first evaluation round backs the decision
+up: `kmeans_restricted` had the lowest relevance rate (see `docs/05_final_report.md`).
 
-```
-Song → global nearest-neighbour search → genre-aware pool → popularity re-rank → artist-diversity cap
-```
+---
 
-- **Audio similarity** is computed on demand against the candidate pool
-  (no precomputed N×N matrix), so KMeans is no longer a gate — it's kept
-  only for the EDA/PCA visualizations below.
-- **Same-genre by default.** Searching a song pulls candidates from its
-  own genre unless you turn that off, for cross-genre discovery.
-- **Popularity is a small tie-breaker**, not a ranking driver — it's
-  weighted low enough that it never turns this into a popularity
-  recommender.
-- **Artist diversity is capped** so one artist can't fill the whole
-  results list.
+## Fix #3 — Duplicate songs
+
+The dataset repeats the same song under different track IDs. De-duplicating by
+track ID alone still left ~8,400 extra copies of songs, so the search box
+listed "Blinding Lights — The Weeknd" five times, and the query song's own
+other copies could appear among its recommendations.
+
+Fixed in two places: one row per (track name, artist) at load time, and at
+recommendation time the query's own title (copies, covers, remixes, "- Remastered"
+versions) is never recommended and near-identical titles are shown once.
+
+## Fix #4 — Feedback buttons had no visible effect
+
+See *How feedback is used* above. The earlier design gave feedback a 5% weight
+and, once the learned model was active, ignored what was voted for that
+specific query. Repeated votes were also counted as independent evidence.
 
 ---
 
@@ -96,7 +174,6 @@ clearly distinct regions of "sound space":
 
 ---
 
-
 ## Tech Stack
 
 | Layer | Tool |
@@ -105,6 +182,8 @@ clearly distinct regions of "sound space":
 | Clustering | scikit-learn (`KMeans`) |
 | Similarity | scikit-learn (`cosine_similarity`) |
 | Scaling | scikit-learn (`StandardScaler`) |
+| Learned re-ranker | scikit-learn (`LogisticRegression`) |
+| Feedback storage | Supabase (hosted Postgres) via `supabase-py` |
 | Album art | Spotify Web API via `spotipy` |
 | Data | [Spotify Tracks Dataset](https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset) (Kaggle) |
 
@@ -114,42 +193,47 @@ clearly distinct regions of "sound space":
 
 ```
 spotify_music_recommendation/
-├── app.py                     # Streamlit UI — layout & user interaction only
-├── music_recommendation.ipynb # Full pipeline: EDA → cleaning → clustering → model export
-├── requirements.txt
+├── app.py                     # Streamlit UI, strategies, ranking
+├── music_recommendation.ipynb # Pipeline: EDA → cleaning → clustering → model export
+├── requirements.txt           # includes supabase
+├── spotify_api.py             # album covers
 │
-├── data/
-│   |── spotify_clustered_dataset.csv
+├── dataset/
+│   ├── spotify_clustered_dataset.csv
 │   └── dataset.csv
-|
+│
 ├── models/
 │   ├── scaler.joblib
 │   └── kmeans.joblib
 │
-|── spotify_api.py         
+├── utils/
+│   ├── feedback.py            # Supabase logging / loading / relevance rate
+│   └── reranker.py            # learned feedback re-ranker (50+ votes)
 │
-└── screenshots/                # Images used in this README
+├── docs/                      # use case, PRD, solution, feedback, final report
+└── screenshots/
 ```
 
-### A note on `spotify_api.py`
+### Secrets
 
-`spotify_api.py` never contains a Client ID or Secret in plain text — it
-reads both from Streamlit secrets at runtime:
+Nothing secret is stored in code. Streamlit secrets hold the keys:
 
 ```toml
-# .streamlit/secrets.toml  (kept out of git — see .gitignore)
+# .streamlit/secrets.toml  (kept out of git)
 SPOTIFY_CLIENT_ID = "your-client-id"
 SPOTIFY_CLIENT_SECRET = "your-client-secret"
+SUPABASE_URL = "https://<project>.supabase.co"
+SUPABASE_KEY = "your-anon-key"
 ```
 
-Get these from your app on the
-[Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
-If a secret is ever exposed (committed by accident, pasted somewhere
-public), treat it as compromised and regenerate it from the same
-dashboard rather than reusing it.
+On Streamlit Community Cloud the same four keys go under **Settings → Secrets**.
+If a secret is ever exposed, regenerate it instead of reusing it. Free Supabase
+projects are paused after a period of inactivity — restore the project from the
+Supabase dashboard if the app reports it cannot reach the database.
 
-On Streamlit Community Cloud, the same two keys are set under the app's
-**Settings → Secrets** instead of a local file.
+The `feedback` table needs columns `id, query_song, strategy, recommended_song,
+vote, evaluator, created_at`, with `vote` restricted to `relevant` or
+`not_relevant`, and row-level-security policies that allow insert and select.
 
 ---
 
@@ -157,45 +241,33 @@ On Streamlit Community Cloud, the same two keys are set under the app's
 
 ```bash
 pip install -r requirements.txt
-
-mkdir .streamlit
-echo 'SPOTIFY_CLIENT_ID = "..."' >> .streamlit/secrets.toml
-echo 'SPOTIFY_CLIENT_SECRET = "..."' >> .streamlit/secrets.toml
-
+mkdir .streamlit   # then add the four keys above to .streamlit/secrets.toml
 streamlit run app.py
 ```
 
----
-
 ## Deploying
 
-1. Push the repo to GitHub (`.streamlit/secrets.toml` should **not** be
-   committed — confirm with `git status`).
-2. On [share.streamlit.io](https://share.streamlit.io), create a new
-   app pointing at this repo, branch `main`, main file `app.py`.
-3. Under **Advanced settings → Secrets**, paste the same two Spotify
-   keys.
-4. Deploy — you'll get a shareable `https://your-app-name.streamlit.app`
-   URL once the build finishes.
+1. Push the repo to GitHub (`.streamlit/secrets.toml` must **not** be committed).
+2. On [share.streamlit.io](https://share.streamlit.io), create an app from the
+   repo, branch `main`, main file `app.py`.
+3. Under **Advanced settings → Secrets**, paste the four keys.
+4. Deploy and share the `https://<your-app>.streamlit.app` URL.
 
 ---
 
 ## Future Improvements
 
-- User feedback loop (thumbs up/down to refine recommendations)
-- Offline evaluation metrics (genre consistency, artist diversity,
-  Precision@K) alongside human ratings, instead of showing raw
-  similarity as "accuracy"
-- Tune `popularity_weight` and `max_per_artist` against real user
-  feedback rather than fixed defaults
+- Fixed set of 5–10 seed songs and more evaluators, so strategy comparisons are
+  repeatable and not one person's taste.
+- Show the strategy comparison with a confidence range, not just a rate.
+- Make the learned re-ranker query-aware (feed in how the recommended song
+  differs from the query song, not only the recommended song's features).
+- Offline metrics (genre consistency, artist diversity, Precision@K) next to
+  human ratings.
+- For a catalogue far beyond ~81k songs: replace brute-force cosine with an
+  approximate nearest-neighbour index (FAISS, or pgvector in Postgres).
 
 ---
 
-Built using Streamlit • Cosine similarity • Spotify API
+Built using Streamlit • Cosine similarity • Supabase • Spotify API
 Developed by **Anshika Jain**
-
----
-
-
-
-

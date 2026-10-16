@@ -13,11 +13,12 @@ Picking a strategy based on intuition or convention (e.g. "KMeans is standard fo
 Testing strategies against a live, licensed catalog is costly and slow, and a bad retrieval choice discovered late means reworking a production system. There's no controlled, repeatable way to compare strategies side by side first.
 
 ## What are we trying to solve?
-Build a controlled evaluation environment — using a public dataset of real Spotify tracks with real audio features (~81k unique tracks, 114 genres) — where different retrieval strategies can be run against the same queries and compared using real evaluator feedback, so a team can pick a strategy with evidence instead of guesswork before applying it to a real, licensed catalog.
+Build a controlled evaluation environment — using a public dataset of real Spotify tracks with real audio features (~81k unique songs, 114 genres) — where different retrieval strategies can be run against the same queries and compared using real evaluator feedback, so a team can pick a strategy with evidence instead of guesswork before applying it to a real, licensed catalog.
 
 ## What assumptions are we making?
 - This dataset can meaningfully differentiate strategies on *relative* performance (which one surfaces more relevant songs), even though it can't validate *absolute* relevance the way real listening/engagement data would.
-- ~81k tracks across 114 genres is enough breadth to expose real trade-offs between strategies (e.g. where hard cluster/genre restriction excludes a relevant song a global search would have found).
+- ~81k songs across 114 genres is enough breadth to expose real trade-offs between strategies (e.g. where hard cluster/genre restriction excludes a relevant song a global search would have found).
+- Each song appears **once** in the catalogue. This was *not* true of the first deployed version (the raw data repeats songs under different track IDs); it is enforced now, because duplicates make a comparison meaningless — a strategy could look good simply by returning another copy of the query song.
 - Results here are directional — informing what to build at scale — not a final production benchmark.
 
 **Note:** an earlier draft of this document described the dataset as
