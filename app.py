@@ -7,6 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from utils.feedback import log_feedback, load_feedback, relevance_rate
 from utils.reranker import get_learned_boost, MIN_FEEDBACK_FOR_MODEL
 import uuid
+import re
 
 if "evaluator_id" not in st.session_state:
     st.session_state.evaluator_id = f"evaluator_{uuid.uuid4().hex[:8]}"
@@ -43,6 +44,17 @@ st.set_page_config(
 )
 
 df = pd.read_csv("dataset/spotify_clustered_dataset.csv")
+
+# The raw Spotify dump lists the same song several times (album / single /
+# compilation re-releases) under different track IDs. That made search lists,
+# recommendations and feedback labels full of copies of the same song. Keep
+# one row per (track_name, artists) -- the most popular copy.
+df = (
+    df.sort_values("popularity", ascending=False)
+      .drop_duplicates(subset=["track_name", "artists"], keep="first")
+      .sort_index()
+      .reset_index(drop=True)
+)
 scaler = joblib.load("models/scaler.joblib")
 kmeans = joblib.load("models/kmeans.joblib")  # kept for EDA/cluster count metric only
 
@@ -371,6 +383,15 @@ strategy_key = st.sidebar.selectbox(
 )
 st.sidebar.caption(STRATEGIES[strategy_key][1])
 
+use_feedback = st.sidebar.checkbox(
+    "Use feedback re-ranking",
+    value=True,
+    help="ON: songs people marked 👍 for this same query move up, 👎 move down, "
+         "and the learned model adds a small nudge. OFF: pure strategy results "
+         "(use this for a clean strategy comparison). Votes cast with it ON are "
+         "tagged '<strategy>+feedback' so the two never get mixed.",
+)
+
 # ---------- Search filters ----------
 st.markdown("### 🔎 Find a song")
 left,right=st.columns(2)
@@ -470,10 +491,48 @@ X_scaled = get_scaled_features()
 
 @st.cache_data(ttl=60)
 def get_feedback_df():
-    # Cached for 60s: reused by the learned re-ranker, the heuristic
-    # fallback, and the aggregate relevance table below — one Supabase
-    # query serves all three instead of one each.
-    return load_feedback()
+    # Cached for 60s so one Supabase query serves the learned re-ranker,
+    # the query-specific boost and the aggregate table.
+    fb = load_feedback()
+    if fb.empty:
+        return fb
+    # Repeated votes on the same (query, strategy, song) are ONE judgement,
+    # not many: collapse them to the majority vote (ties -> not_relevant).
+    keys = ["query_song", "strategy", "recommended_song"]
+    fb = fb.assign(is_rel=(fb["vote"] == "relevant").astype(int))
+    out = fb.groupby(keys, as_index=False).agg(
+        share=("is_rel", "mean"), n_votes=("is_rel", "size"))
+    out["vote"] = np.where(out["share"] > 0.5, "relevant", "not_relevant")
+    return out
+
+# How strongly "people marked this song 👍/👎 for THIS query" moves the ranking.
+# Top candidates differ by ~0.01 in score, so 0.10 is clearly visible.
+QUERY_FEEDBACK_WEIGHT = 0.10
+
+def query_feedback_boost(pool_df, query_label):
+    """
+    Per-query memory. For this exact query song, songs evaluators marked 👍
+    move up and songs marked 👎 move down. Shrunk by (n + 1) so a single vote
+    counts less than several agreeing votes: 1 vote -> +/-0.5, 3 -> +/-0.75.
+    """
+    fb = get_feedback_df()
+    if fb.empty:
+        return np.zeros(len(pool_df))
+    fb_q = fb[fb["query_song"] == query_label]
+    if fb_q.empty:
+        return np.zeros(len(pool_df))
+    g = fb_q.groupby("recommended_song")["vote"].agg(
+        rel=lambda v: int((v == "relevant").sum()), n="count")
+    score = (2 * g["rel"] - g["n"]) / (g["n"] + 1)
+    labels = pool_df["track_name"] + " — " + pool_df["artists"]
+    return labels.map(score).fillna(0.0).to_numpy()
+
+def _norm_title(t):
+    """Lower-case title without (feat..)/(Remix)/[Live] or '- Remastered' tails."""
+    t = str(t).lower()
+    t = re.sub(r"[\(\[].*?[\)\]]", "", t)
+    t = t.split(" - ")[0]
+    return re.sub(r"\s+", " ", t).strip()
 
 def apply_feedback_boost(pool_df, pool_scaled, similarity):
     """
@@ -539,7 +598,7 @@ def build_pool(selected_row, strategy):
     return pool_df
 
 
-def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10, feedback_weight=0.05, max_per_artist=2):
+def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10, feedback_weight=0.05, max_per_artist=2, use_feedback=True):
     """
     Retrieval-strategy-aware recommender. strategy selects the candidate
     pool (see build_pool); ranking logic is shared across strategies so the
@@ -586,7 +645,13 @@ def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10,
     pop_range = pop.max() - pop.min()
     pop_norm = (pop - pop.min()) / pop_range if pop_range > 0 else np.zeros_like(pop)
 
-    feedback_boost, reranker_active = apply_feedback_boost(pool_df, pool_scaled, similarity)
+    query_label = f"{song_name} — {selected_artist}"
+    if use_feedback:
+        feedback_boost, reranker_active = apply_feedback_boost(pool_df, pool_scaled, similarity)
+        query_boost = query_feedback_boost(pool_df, query_label)
+    else:
+        feedback_boost, reranker_active = np.zeros(len(pool_df)), False
+        query_boost = np.zeros(len(pool_df))
     st.session_state["_reranker_active"] = reranker_active
 
     base_weight = 1 - popularity_weight - feedback_weight
@@ -594,10 +659,12 @@ def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10,
         base_weight * similarity
         + popularity_weight * pop_norm
         + feedback_weight * feedback_boost
+        + QUERY_FEEDBACK_WEIGHT * query_boost
     )
 
     order = np.argsort(-final_score)
 
+    query_title = _norm_title(selected_row["track_name"])
     recommendations = []
     seen = set()
     artist_count = {}
@@ -607,14 +674,17 @@ def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10,
         song = pool_df.iloc[pos]
 
         if song.name == idx:
-            continue  # skip the query song itself (matched by index, not just name)
+            continue  # the query song itself
 
-        key = (song.track_name, song.artists)
+        title = _norm_title(song.track_name)
+        if title == query_title:
+            continue  # other copies / covers / remixes of the query song
+
+        primary_artist = song.artists.split(";")[0]
+        key = (title, primary_artist.lower())
 
         if key in seen:
             continue
-
-        primary_artist = song.artists.split(";")[0]
 
         if artist_count.get(primary_artist, 0) >= max_per_artist:
             continue
@@ -622,7 +692,9 @@ def recommend(song_name, n=10, strategy="global_cosine", popularity_weight=0.10,
         seen.add(key)
         artist_count[primary_artist] = artist_count.get(primary_artist, 0) + 1
 
-        recommendations.append((song, final_score[pos]))
+        # similarity (pure audio closeness) is what the card shows as the
+        # "sound match"; ranking itself used final_score.
+        recommendations.append((song, float(similarity[pos])))
 
         if len(recommendations) == n:
             break
@@ -637,6 +709,7 @@ if recommend_clicked:
             selected_song,
             top_n,
             strategy=strategy_key,
+            use_feedback=use_feedback,
         )
 
     # Stored in session_state rather than used directly: clicking a 👍/👎
@@ -650,11 +723,16 @@ if recommend_clicked:
     st.session_state["current_query_display"] = selected
     st.session_state["current_selected_song"] = selected_song
     st.session_state["current_strategy"] = strategy_key
+    st.session_state["current_fb_on"] = use_feedback
 
 if "current_songs" in st.session_state:
 
     songs = st.session_state["current_songs"]
     strategy_used = st.session_state["current_strategy"]
+    fb_on = st.session_state.get("current_fb_on", True)
+    # Votes cast with feedback re-ranking ON are tagged separately so the
+    # clean strategy comparison is never mixed with feedback-influenced runs.
+    strategy_tag = strategy_used + ("+feedback" if fb_on else "")
 
     if not songs:
         st.warning("Couldn't find that song in the dataset.")
@@ -663,13 +741,19 @@ if "current_songs" in st.session_state:
         st.caption(f"Strategy: **{STRATEGIES[strategy_used][0]}**")
 
         fb_count = len(get_feedback_df())
-        if st.session_state.get("_reranker_active"):
-            st.caption(f"🧠 Learned re-ranker active — trained on {fb_count} votes")
+        if not fb_on:
+            st.caption("🧪 Feedback re-ranking is OFF — pure strategy results")
+        elif st.session_state.get("_reranker_active"):
+            st.caption(f"🧠 Learned re-ranker active — trained on {fb_count} unique votes")
         else:
             st.caption(
                 f"📊 Using heuristic feedback boost — {fb_count}/{MIN_FEEDBACK_FOR_MODEL} "
-                "votes needed (with both 👍 and 👎 present) before the learned re-ranker activates"
+                "unique votes needed (with both 👍 and 👎 present) before the learned re-ranker activates"
             )
+        st.caption(
+            "Sound match = how close the audio is to your song. Results are ranked by "
+            "sound match + popularity (Spotify's 0–100 score) + feedback."
+        )
 
         # Cards render through st.columns (not one big HTML grid) so the
         # 👍/👎 buttons underneath are real Streamlit widgets — raw HTML
@@ -686,12 +770,12 @@ if "current_songs" in st.session_state:
                     if not image:
                         image = DEFAULT_IMAGE
 
-                    match_pct = min(int(round(score * 100)), 99)
+                    match_pct = max(0, min(int(round(score * 100)), 99))
 
                     st.markdown(f"""
 <div class="poster-card">
   <div class="poster-image" style="background-image:url('{image}')">
-    <div class="poster-badge">{match_pct} match</div>
+    <div class="poster-badge">{match_pct}% sound match</div>
     <div class="poster-scrim">
       <h4>{row.track_name}</h4>
       <p>{row.artists}</p>
@@ -711,7 +795,7 @@ if "current_songs" in st.session_state:
                     if fb_up.button("👍", key=f"up_{song_key}", use_container_width=True):
                         log_feedback(
                             query_song=st.session_state["current_query_display"],
-                            strategy=strategy_used,
+                            strategy=strategy_tag,
                             recommended_song=recommended_song_label,
                             vote="relevant",
                             evaluator=evaluator_id,
@@ -720,7 +804,7 @@ if "current_songs" in st.session_state:
                     if fb_down.button("👎", key=f"down_{song_key}", use_container_width=True):
                         log_feedback(
                             query_song=st.session_state["current_query_display"],
-                            strategy=strategy_used,
+                            strategy=strategy_tag,
                             recommended_song=recommended_song_label,
                             vote="not_relevant",
                             evaluator=evaluator_id,
@@ -737,6 +821,10 @@ if "current_songs" in st.session_state:
                 st.caption("No feedback logged yet — vote 👍/👎 above to populate this.")
             else:
                 st.dataframe(agg, use_container_width=True, hide_index=True)
+                st.caption(
+                    "Repeated votes on the same query + song count once. "
+                    "Rows ending in '+feedback' were voted with feedback re-ranking ON."
+                )
 
 st.divider()
 
