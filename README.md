@@ -237,20 +237,104 @@ vote, evaluator, created_at`, with `vote` restricted to `relevant` or
 
 ---
 
-## Running Locally
+## Installation & Usage Guide
 
+### Option A: Just use the app
+Open the hosted app: **https://musically-anshika.streamlit.app**
+Pick a song, choose a retrieval strategy, and vote 👍/👎 on the results. No setup needed.
+
+### Option B: Run your own copy
+
+**Prerequisites:** Python 3.10+ and Git. Free accounts on
+[Spotify for Developers](https://developer.spotify.com/dashboard) (album art) and
+[Supabase](https://supabase.com) (feedback storage).
+
+**1. Clone and install**
 ```bash
+git clone https://github.com/anshika-aj/music-recommendation.git
+cd music-recommendation
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-mkdir .streamlit   # then add the four keys above to .streamlit/secrets.toml
+```
+
+**2. Get the data and models**
+The app needs `dataset/spotify_clustered_dataset.csv`, `models/scaler.joblib`
+and `models/kmeans.joblib`. If they are not in the repo:
+1. Download the [Spotify Tracks Dataset](https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset)
+   from Kaggle and save it as `dataset/dataset.csv`.
+2. Run `music_recommendation.ipynb` top to bottom. It cleans the data,
+   clusters it, and writes the files above.
+
+**3. Create your own Supabase project (for feedback)**
+1. Create a new project at [supabase.com](https://supabase.com).
+2. Open **SQL Editor** and run:
+```sql
+create table feedback (
+  id bigint generated always as identity primary key,
+  query_song text not null,
+  strategy text not null,
+  recommended_song text not null,
+  vote text not null check (vote in ('relevant', 'not_relevant')),
+  evaluator text,
+  created_at timestamptz default now()
+);
+
+alter table feedback enable row level security;
+create policy "allow insert" on feedback for insert to anon with check (true);
+create policy "allow select" on feedback for select to anon using (true);
+```
+3. Go to **Project Settings → API** and copy the **Project URL** and the
+   **anon public key**.
+
+> Each person running their own copy should use **their own** Supabase project.
+> The maintainer's database keys are never shared.
+
+**4. Create a Spotify app (for album covers)**
+In the Spotify Developer Dashboard, create an app and copy its
+**Client ID** and **Client Secret**.
+
+**5. Add your secrets**
+Create `.streamlit/secrets.toml` (git-ignored, never commit it):
+```toml
+SPOTIFY_CLIENT_ID = "your-client-id"
+SPOTIFY_CLIENT_SECRET = "your-client-secret"
+SUPABASE_URL = "https://<your-project>.supabase.co"
+SUPABASE_KEY = "your-anon-key"
+```
+
+**6. Run**
+```bash
 streamlit run app.py
 ```
+Open http://localhost:8501.
+
+> The app still starts without Supabase or Spotify keys: votes just won't be
+> saved and album covers will fall back to a logo.
+
+### Using the app
+1. Search for a song you know and select it.
+2. Choose a **retrieval strategy** (see the strategies table above), or compare several on the same song.
+3. Read the cards: **% sound match** is audio similarity, **⭐ popularity** is Spotify's score.
+4. Vote 👍/👎 on each result. Votes are saved to your Supabase project and feed the comparison table and re-ranking.
+5. Toggle **Use feedback re-ranking** to include or exclude past votes from the ordering.
+
+### Troubleshooting
+| Problem | Fix |
+|---|---|
+| "Vote not saved" warning | Check `SUPABASE_URL` / `SUPABASE_KEY`, that the `feedback` table exists, and that the RLS policies were created. |
+| Supabase unreachable | Free projects pause when inactive. Restore the project from the Supabase dashboard. |
+| Album covers show a logo | Check the Spotify Client ID/Secret in `secrets.toml`. |
+| File not found for dataset/models | Run the notebook (step 2). |
+
+---
 
 ## Deploying
 
 1. Push the repo to GitHub (`.streamlit/secrets.toml` must **not** be committed).
 2. On [share.streamlit.io](https://share.streamlit.io), create an app from the
    repo, branch `main`, main file `app.py`.
-3. Under **Advanced settings → Secrets**, paste the four keys.
+3. Under **Advanced settings → Secrets**, paste the same four keys from step 5 above (use the TOML format, no `secrets.toml` file needed).
 4. Deploy and share the `https://<your-app>.streamlit.app` URL.
 
 ---
